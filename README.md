@@ -2,10 +2,6 @@
 
 面向 Linux x86_64 的 Insta360 全景预览转换服务。通过官方 **Insta360 MediaSDK** 递归处理事件档案中的 INSP、INSV 和 LRV，在原目录生成 `_preview.jpg` / `_preview.mp4`、处理说明和文件操作审计日志，保留原始文件。
 
-## AI 编码声明
-
-本项目初始版本的应用代码、自动化测试、Docker/Compose 配置、GitHub Actions 工作流及文档由 **OpenAI Codex（AI 编码工具）生成和修改**。
-
 ## 功能
 
 - 递归扫描多层事件目录，支持中文、空格和大小写扩展名。
@@ -182,8 +178,16 @@ python3 -m converter --data-dir /绝对路径/data once
 
 测试覆盖镜头配对、孤立镜头、符号链接、输出冲突、上传等待、幂等、源文件变更、文件保护、重试、超时、中断和实例锁，以及真实媒体工具的时间、GPS、360 UUID 与音轨校验。自动化测试使用 SDK 测试替身，实际拼接质量与机型兼容性需要使用官方 SDK 和相机原片单独验证。
 
-## 许可证与参考
-
-项目采用 [AGPL-3.0](LICENSE) 许可证。Insta360 SDK 的使用和分发遵循其独立许可条款。
+## 参考文档
 
 官方参考：[MediaSDK 仓库](https://github.com/Insta360Develop/Desktop-MediaSDK-Cpp)、[MediaSDK 接口文档](https://github.com/Insta360Develop/Insta360-Developer_Docs/blob/main/docs/ch/sdk/x-ace-go/desktop/media.md)。命令行参数和包布局以实际安装版本自带的 README 和 `MediaSDKTest -help` 为准。
+
+## AI 编码声明
+
+本项目由 AI 编码。项目的应用代码、自动化测试、容器部署配置、GitHub Actions 工作流及文档等工作，主要由 **OpenAI Codex（GPT-6）** 根据项目发布者的需求生成、修改和整理。
+
+项目发布者负责对 AI 生成的内容进行实际测试、审核、部署与后续维护。
+
+## 许可证
+
+项目采用 [AGPL-3.0](LICENSE) 许可证。Insta360 SDK 的使用和分发遵循其独立许可条款。
