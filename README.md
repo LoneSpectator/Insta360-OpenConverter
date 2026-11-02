@@ -1,10 +1,10 @@
 # Insta360 OpenConverter
 
-面向 Linux x86_64 的 Insta360 全景预览转换服务。通过官方 **Insta360 MediaSDK** 递归处理事件档案中的 INSP、INSV 和 LRV，在原目录生成 `_preview.jpg` / `_preview.mp4`、处理说明和文件操作审计日志，保留原始文件。
+面向 Linux x86_64 的 Insta360 全景预览转换服务。通过官方 **Insta360 MediaSDK** 递归处理指定目录中的 INSP、INSV 和 LRV，在原目录生成 `_preview.jpg` / `_preview.mp4`、处理说明和文件操作审计日志，保留原始文件。
 
 ## 功能
 
-- 递归扫描多层事件目录，支持中文、空格和大小写扩展名。
+- 递归扫描多层指定目录，支持中文、空格和大小写扩展名。
 - INSP 转 JPG，INSV/LRV 转 MP4；自动配对双镜头视频文件。
 - 输出 2:1 全景预览，写入 GPano / GSpherical 标记，复制目标格式支持的拍摄元数据。
 - 持久化处理状态，跳过未变文件，等待上传完成并重试失败任务。
