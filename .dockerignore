@@ -1,0 +1,10 @@
+.git
+__pycache__
+**/__pycache__
+**/*.py[cod]
+tests
+sdk
+data
+*.gz
+*.deb
+.env

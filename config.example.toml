@@ -1,0 +1,28 @@
+# 所有路径都是容器内路径。只修改 photo_root 还需要相应修改挂载位置。
+photo_root = "/photo"
+scan_interval = 60
+# 文件最后修改至少 120 秒后才处理；转码结束时再次核对源文件。
+settle_seconds = 120
+retry_seconds = 300
+command_timeout = 7200
+width = 3840
+height = 1920
+bitrate = 20000000
+codec = "h264"
+flowstate = true
+stitch_type = "optflow"
+camera_accessory_type = 0
+
+[sdk]
+executable = "/data/sdk/media/bin/MediaSDKTest"
+models = "/data/sdk/media/bin/models"
+library_dirs = ["/data/sdk/media/lib", "/data/sdk/media/bin"]
+# 当前提供的 MediaSDK 3.1.5 必须使用 GPU。
+mode = "gpu"
+# 只有官方明确确认该包支持 CPU，且验证过其命令行接口后才能改为 true。
+cpu_compatible = false
+extra_args = []
+
+[tools]
+exiftool = "exiftool"
+ffprobe = "ffprobe"
