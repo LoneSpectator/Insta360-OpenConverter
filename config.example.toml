@@ -26,3 +26,8 @@ extra_args = []
 [tools]
 exiftool = "exiftool"
 ffprobe = "ffprobe"
+
+[metadata]
+# 使用官方 InsMetaDataSDK 读取源文件；适配器由 prepare_metadata_sdk.py 本地编译。
+reader = "/data/sdk/metadata/bin/insta360-metadata"
+library_dirs = ["/data/sdk/metadata/lib"]

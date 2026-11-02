@@ -210,6 +210,33 @@ shutil.copyfile(fixture, output)
         self.cfg.executable = str(self.sdk)
         self.cfg.models = str(self.root / "models")
         Path(self.cfg.models).mkdir()
+        self.metadata_sdk = self.root / "fake_metadata.py"
+        self.metadata_payload = self.root / "sdk-payload.json"
+        self.metadata_sdk.write_text(f'''#!{sys.executable}
+import json, sys
+from pathlib import Path
+schema = {{"reader": "insta360-metadata", "schema_version": 1, "sdk": "InsMetaDataSDK"}}
+if sys.argv[1:] == ["--schema"]:
+    print(json.dumps(schema))
+    sys.exit(0)
+if "metadata-fail" in Path(sys.argv[1]).name:
+    print("InsMetaDataSDK Parse failed (simulated)", file=sys.stderr)
+    sys.exit(3)
+payload = Path({str(self.metadata_payload)!r})
+data = json.loads(payload.read_text()) if payload.exists() else {{}}
+directory = Path(sys.argv[2])
+tracks = {{}}
+for name in ("gps", "gyro", "exposure", "timelapse"):
+    values = data.pop(name, [])
+    (directory / (name + ".jsonl")).write_text("".join(json.dumps(value) + "\\n" for value in values))
+    tracks[name] = {{"available": bool(values), "count": len(values), "file": name + ".jsonl"}}
+summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number": "",
+           "gyro_first_timestamp_ms": 0, **data, "tracks": tracks}}
+(directory / "sdk.json").write_text(json.dumps(summary))
+''', encoding="utf-8")
+        self.metadata_sdk.chmod(0o755)
+        self.cfg.metadata_reader = str(self.metadata_sdk)
+        self.cfg.metadata_library_dirs = []
         self.runner = Runner(self.audit, threading.Event(), 30)
         self.service = Service(self.cfg, self.audit, self.runner)
         self.addCleanup(self.service.close)
@@ -358,7 +385,8 @@ shutil.copyfile(fixture, output)
             "settle_seconds = 0", "scan_interval = 1", "[sdk]",
             f"executable = {json.dumps(str(self.sdk))}",
             f"models = {json.dumps(self.cfg.models)}", "library_dirs = []", "[tools]",
-            f"exiftool = {json.dumps(EXIFTOOL)}", "",
+            f"exiftool = {json.dumps(EXIFTOOL)}", "[metadata]",
+            f"reader = {json.dumps(str(self.metadata_sdk))}", "library_dirs = []", "",
         ]), encoding="utf-8")
         process = subprocess.Popen([sys.executable, "-m", "converter", "--data-dir", str(data), "watch"],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -383,6 +411,70 @@ shutil.copyfile(fixture, output)
                 process.kill()
                 process.wait()
             process.stderr.close()
+
+    def test_official_fields_override_standard_metadata_and_keep_sensor_tracks(self):
+        source = self.source("sdk-fields.insv")
+        payload = {"camera_type": "Insta360 X5", "firmware_version": "v1.2.3", "serial_number": "TEST-SERIAL",
+                   "gyro_first_timestamp_ms": 1_700_000_000_000,
+                   "gps": [{"timestampMs": 1_700_000_000, "latitude": 31.1234567890123,
+                            "north_south": "S", "longitude": 121.2345678901234,
+                            "east_west": "W", "altitude": 12.75}],
+                   "gyro": [{"timestamp": 123456789, "acceleration": [0.1, 0.2, 0.3], "rotation": [1, 2, 3]}],
+                   "exposure": [{"timestamp": 123456789, "shutter_speed_s": 0.004}],
+                   "timelapse": [{"timestamp": 123456789}]}
+        self.metadata_payload.write_text(json.dumps(payload))
+        self.assertEqual(self.service.scan_once()["success"], 1)
+        actual = self.service.media.metadata(Job((source,)).output)
+        self.assertEqual(actual["XMP-tiff:Model"], "Insta360 X5")
+        self.assertEqual(actual["XMP-aux:SerialNumber"], "TEST-SERIAL")
+        self.assertEqual(actual["XMP-aux:Firmware"], "v1.2.3")
+        self.assertAlmostEqual(float(actual["XMP-exif:GPSLatitude"]), -31.1234567890123, places=8)
+        self.assertAlmostEqual(float(actual["XMP-exif:GPSLongitude"]), -121.2345678901234, places=8)
+        self.assertEqual(actual["XMP-exif:DateTimeOriginal"], "2024:06:01 12:34:56+08:00")
+        snapshot_path, = (self.data / "metadata").glob("*.json")
+        sdk = json.loads(snapshot_path.read_text())["Insta360SDK"]
+        self.assertEqual(sdk["gyro_first_timestamp_ms"], payload["gyro_first_timestamp_ms"])
+        directory = Path(sdk["snapshot_directory"])
+        for name in ("gps", "gyro", "exposure", "timelapse"):
+            self.assertEqual(sdk["tracks"][name]["count"], 1)
+            values = [json.loads(line) for line in (directory / (name + ".jsonl")).read_text().splitlines()]
+            self.assertEqual(values, payload[name])
+            self.assertEqual(digest(directory / (name + ".jsonl")), sdk["tracks"][name]["sha256"])
+
+    def test_metadata_sdk_failure_is_not_replaced_with_an_exiftool_success(self):
+        source = self.source("metadata-fail.insv")
+        self.assertEqual(self.service.scan_once()["failed"], 1)
+        self.assertFalse(Job((source,)).output.exists())
+        self.assertIn("InsMetaDataSDK Parse failed", Job((source,)).report.read_text())
+        self.assertFalse(list((self.data / "metadata").glob(".insta360-metadata-*")))
+
+    def test_gyro_origin_does_not_create_a_capture_date(self):
+        source = self.event / "gyro-origin.insp"
+        shutil.copyfile(self.image, source)
+        self.metadata_payload.write_text(json.dumps({"gyro_first_timestamp_ms": 1_700_000_000_000}))
+        self.assertEqual(self.service.scan_once()["success"], 1)
+        self.assertNotIn("XMP-exif:DateTimeOriginal", self.service.media.metadata(Job((source,)).output))
+
+    def test_standalone_metadata_command_does_not_require_media_sdk_or_gpu(self):
+        source = self.source("inspect.insv")
+        before = digest(source)
+        data = self.root / "inspect-data"
+        data.mkdir()
+        (data / "config.toml").write_text("\n".join([
+            f"photo_root = {json.dumps(str(self.photo))}", "[sdk]",
+            'executable = "/missing/MediaSDKTest"', 'models = "/missing/models"',
+            "[tools]", f"exiftool = {json.dumps(EXIFTOOL)}", "[metadata]",
+            f"reader = {json.dumps(str(self.metadata_sdk))}", "library_dirs = []", "",
+        ]), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-m", "converter", "--data-dir", str(data),
+                                 "metadata", str(source)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        metadata_file, = (data / "metadata").glob("*.json")
+        metadata = json.loads(metadata_file.read_text())
+        self.assertEqual(metadata["Insta360SDK"]["sdk"], "InsMetaDataSDK")
+        self.assertTrue(Path(metadata["Insta360SDK"]["snapshot_directory"]).is_dir())
+        self.assertEqual(digest(source), before)
+        self.assertFalse(Job((source,)).output.exists())
 
 
 if __name__ == "__main__":

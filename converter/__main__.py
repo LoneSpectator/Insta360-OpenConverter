@@ -1,21 +1,29 @@
 import argparse
+import hashlib
+import json
 from pathlib import Path
 import signal
 import sys
 import threading
 import traceback
+import uuid
 
 from .audit import Audit, Cancelled, Runner
 from .config import Config
-from .service import Service
+from .media import Media, capture_fields
+from .scan import digest, snapshot
+from .service import Service, atomic_text
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Insta360 recursive offline preview converter")
     parser.add_argument("--data-dir", type=Path, default=Path("/data"))
     parser.add_argument("--config", type=Path, help="Default: <data-dir>/config.toml")
-    parser.add_argument("command", choices=["watch", "once", "doctor"], nargs="?", default="watch")
+    parser.add_argument("command", choices=["watch", "once", "doctor", "metadata"], nargs="?", default="watch")
+    parser.add_argument("source", type=Path, nargs="?", help="Source file for the metadata command")
     args = parser.parse_args(argv)
+    if (args.command == "metadata") != (args.source is not None):
+        parser.error("metadata requires a source file; other commands do not accept one")
     args.data_dir.mkdir(parents=True, exist_ok=True)
     audit = Audit(args.data_dir)
     service = None
@@ -33,6 +41,23 @@ def main(argv=None):
         audit.emit("service.start", command=args.command, config_path=config_path,
                    config_fingerprint=cfg.fingerprint(), mode=cfg.mode)
         runner = Runner(audit, stop, cfg.command_timeout)
+        if args.command == "metadata":
+            source = args.source.absolute()
+            before = snapshot(source)
+            source_sha = digest(source, audit)
+            token = hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest()
+            media = Media(cfg, runner, audit)
+            media.metadata_sdk.doctor()
+            metadata = media.source_metadata(source, token + "-inspect")
+            if snapshot(source) != before:
+                raise RuntimeError("Source changed during metadata extraction")
+            output = cfg.data_root / "metadata" / f"{token}-inspect-{uuid.uuid4().hex}.json"
+            audit.emit("file.write_metadata_snapshot", source=source, destination=output)
+            atomic_text(output, json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+            audit.emit("metadata.inspect.complete", source=source, source_sha256=source_sha,
+                       snapshot=output, sdk_directory=metadata["Insta360SDK"]["snapshot_directory"],
+                       capture_fields=capture_fields(metadata))
+            return 0
         service = Service(cfg, audit, runner)
         service.doctor()
         if args.command == "doctor":

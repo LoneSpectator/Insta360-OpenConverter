@@ -17,20 +17,20 @@
 | --- | --- |
 | 平台 | Linux x86_64；容器基于 Ubuntu 22.04，镜像架构为 `linux/amd64` |
 | 容器环境 | Docker Engine、Compose v2；GPU 部署需 NVIDIA Container Toolkit |
-| SDK | 官方 Linux x86_64 MediaSDK，包含 `MediaSDKTest`、运行库和模型，独立获取并挂载 |
+| SDK | 官方 Linux x86_64 MediaSDK（拼接）和 InsMetaDataSDK（元数据读取），分别获取并只读挂载 |
 | GPU | 默认使用 NVIDIA GPU；驱动需兼容 SDK 包内 CUDA 运行时，具体版本以 SDK 文档为准 |
 | CPU | 尚未完成兼容性验证；需要支持 CPU 的官方 SDK 和对应命令行接口 |
 | 文件系统 | 档案目录可读写，支持硬链接和原子重命名；SDK 目录可读取和执行 |
 
-官方 [Desktop 指南](https://github.com/Insta360Develop/Insta360-Developer_Docs/blob/main/docs/ch/sdk/x-ace-go/desktop/guide.md) 要求 **MediaSDK 3.x 使用独立 GPU**，软件编解码选项不构成纯 CPU 拼接支持。离线处理不依赖 CameraSDK；当前元数据处理使用 ExifTool，尚未集成 InsMetaDataSDK。
+官方 [Desktop 指南](https://github.com/Insta360Develop/Insta360-Developer_Docs/blob/main/docs/ch/sdk/x-ace-go/desktop/guide.md) 要求 **MediaSDK 3.x 使用独立 GPU**，软件编解码选项不构成纯 CPU 拼接支持。InsMetaDataSDK 元数据读取可独立运行，不需要 MediaSDK 或 GPU。离线文件处理不依赖 CameraSDK。
 
-**验证状态**：自动化测试覆盖扫描、重试、文件保护、JPG/MP4 元数据读写及容器运行。SDK 调用使用测试替身；真实 SDK 拼接、机型/LRV 兼容性与 GPU 执行尚未完成原片验证。
+**验证状态**：自动化测试覆盖扫描、文件保护、SDK 字段映射、轨迹保存和 JPG/MP4 元数据回读。官方 InsMetaDataSDK 2.0.2 用于本地编译、加载和错误路径验证；公开 CI 的 SDK 调用使用测试替身。真实相机数据和 MediaSDK 拼接、机型/LRV 兼容性仍需原片验证。
 
 ## 部署
 
 ### 准备 SDK 和配置
 
-从 [Insta360 开发者平台](https://www.insta360.com/sdk/apply) 获取 Linux x86_64 MediaSDK。NVIDIA GPU 驱动安装在宿主机，通过 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) 提供给容器；保留 SDK 包中完整的运行库和模型。
+从 [Insta360 开发者平台](https://www.insta360.com/sdk/apply) 获取 Linux x86_64 MediaSDK 和 InsMetaDataSDK。NVIDIA GPU 驱动安装在宿主机，通过 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) 提供给容器；保留 MediaSDK 包中完整的运行库和模型。
 
 在本仓库根目录执行：
 
@@ -48,6 +48,28 @@ python3 scripts/prepare_sdk.py \
 将命令中的归档路径替换为实际下载路径。脚本在临时目录中解包；对 `.deb` 使用 `dpkg-deb --extract` 提取文件，不执行安装脚本。识别到 `bin/MediaSDKTest`、`lib/`、`bin/models/` 后，将完整 SDK 整理到 `sdk/media`，不会覆盖已有目标目录。
 
 包结构不匹配时脚本会退出，需按 SDK 自带的 README 检查布局。有官方校验值时可追加 `--sha256 <官方校验值>`；默认输出的本地 SHA256 用于记录归档指纹。
+
+元数据适配器使用项目内的 C++ 源码与官方 InsMetaDataSDK 头文件、动态库编译。可在 Ubuntu 22.04、GCC 11 或更新的兼容环境中执行：
+
+```bash
+python3 scripts/prepare_metadata_sdk.py \
+  /path/to/InsMetaDataSDK-linux64.tar.gz \
+  ./sdk/metadata
+```
+
+建议使用容器内的编译环境，以匹配运行镜像。完成下方 `.env` 配置后，先构建镜像，再挂载归档所在目录与 SDK 输出目录：
+
+```bash
+docker compose -f compose.yaml -f compose.gpu.yaml build
+docker run --rm --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=$PWD/sdk,dst=/sdk" \
+  --mount "type=bind,src=/path/to/sdk-archives,dst=/archives,readonly" \
+  --entrypoint python3 insta360-openconverter:local \
+  /app/scripts/prepare_metadata_sdk.py \
+  /archives/InsMetaDataSDK-linux64.tar.gz /sdk/metadata
+```
+
+归档路径替换为实际位置；使用 GHCR 镜像时将命令中的本地镜像名替换为对应镜像。准备结果包含 `bin/insta360-metadata`、官方头文件和 `lib/libInsMetaDataSDK.so`，并用 `build.json` 记录归档、适配器源码和二进制的 SHA256。SDK 及编译结果留在本地 `sdk/metadata`，由 Compose 只读挂载，不参与公开镜像构建。
 
 编辑 `.env`：
 
@@ -80,10 +102,19 @@ docker compose -f compose.yaml -f compose.gpu.yaml up -d --force-recreate
 | `doctor` | 检查依赖和 SDK 命令行接口，不执行素材拼接 |
 | `once` | 扫描一遍后退出；存在失败或等待中的文件时返回 1，全部完成时返回 0 |
 | `watch` | 持续扫描；单文件失败不影响其他任务，默认 300 秒后重试 |
+| `metadata <文件路径>` | 只提取元数据和传感器轨迹，不调用 MediaSDK，不生成预览 |
 
 依赖或配置无效时启动失败。`SIGTERM/SIGINT` 会终止当前 SDK 子进程组并清理本次临时文件，不发布半成品。首次部署需检查测试档案的画面、声音、拍摄时间与 GPS，再接入完整档案。
 
 修改配置或 GPU 设备后，重新运行上述 `up -d --force-recreate` 命令生效；仅修改配置无需重建镜像。
+
+独立元数据读取示例（无需 GPU override）：
+
+```bash
+docker compose run --rm converter metadata /photo/VID_sample.insv
+```
+
+结果保存在 `/data/metadata`，完成日志中的 `snapshot` 和 `sdk_directory` 分别指向汇总 JSON 与原始轨迹目录。源文件解析失败时返回错误，不会静默使用 ExifTool 代替官方 SDK。
 
 ### 转换配置
 
@@ -100,6 +131,8 @@ docker compose -f compose.yaml -f compose.gpu.yaml up -d --force-recreate
 | `bitrate` | `20000000` | 视频输出码率，bps |
 | `codec` | `h264` | 视频编码，支持 `h264` / `h265` |
 | `sdk.mode` | `gpu` | SDK 执行模式 |
+| `metadata.reader` | `/data/sdk/metadata/bin/insta360-metadata` | 官方元数据 SDK 的本地适配器 |
+| `metadata.library_dirs` | `["/data/sdk/metadata/lib"]` | 元数据 SDK 运行库目录 |
 
 CPU 适配需要支持 CPU 的官方 SDK，并验证其软件编解码、CUDA 开关和 CPU 渲染参数。完成适配后设置 `sdk.mode = "cpu"`、`sdk.cpu_compatible = true`，仅使用 `compose.yaml` 部署。该配置开关不提供 SDK 本身缺失的 CPU 能力。
 
@@ -121,9 +154,16 @@ CPU 适配需要支持 CPU 的官方 SDK，并验证其软件编解码、CUDA �
   state.sqlite3                           # 持久化处理状态和生成物归属
   converter.lock
   health.json                             # 最近完整扫描的结果及时间
-  metadata/<任务指纹>-<输入序号>.json         # ExifTool 可读元数据快照
+  metadata/<任务指纹>-<输入序号>.json         # SDK 与标准元数据汇总
+  metadata/<任务标识>.sdk-<唯一ID>/
+    sdk.json                              # 官方 SDK 原始字段、轨迹数量及可用状态
+    gps.jsonl                             # GPS 原始轨迹
+    gyro.jsonl                            # 陀螺仪与加速度
+    exposure.jsonl                        # 曝光与快门速度
+    timelapse.jsonl                       # 延时摄影时间戳
   log/<启动时间带时区>-<PID>.log             # 每次启动新建，JSON Lines
   sdk/media/                              # 只读挂载的 SDK
+  sdk/metadata/                           # 只读挂载的元数据 SDK 与适配器
 ```
 
 - 扫描整个 `photo_root`，包括多层事件目录；`YYYYMMDD.事件名称` 用于说明文件中的事件识别，不限制更深层文件。大小写扩展名和中文/空格路径均支持。不跟随符号链接，也不扫描本工具的临时目录。
@@ -138,9 +178,13 @@ CPU 适配需要支持 CPU 的官方 SDK，并验证其软件编解码、CUDA �
 
 照片写入 Google **GPano**，视频写入视频轨内的 **GSpherical UUID**（Spherical Video v1）。全景画面为 2:1 单目等距柱状投影，播放效果取决于播放器对全景元数据的支持。
 
-ExifTool 复制目标格式支持的 EXIF/XMP/IPTC 或 QuickTime 字段，再显式保留并回读核对可识别的拍摄时间（包含已有时区）、相机品牌/型号、GPS 经纬度；尺寸、方向和全景几何字段更新为预览实际值。MP4 保留可复制的 QuickTime 创建/修改日期，拍摄时间同时写到 XMP。预览文件 mtime 跟随第一原片。原片没有可识别拍摄时间时明确记日志，不从事件名称、文件名或当前时区猜测拍摄时间。
+源文件的相机型号、固件、序列号和传感器轨迹通过 **官方 InsMetaDataSDK** 读取。预览优先使用 SDK 相机字段和首个有效 GPS 点，按南北/东西标记处理坐标符号；完整原始轨迹单独保存为 JSON Lines，记录 SHA256、数量和 SDK 可用状态，避免日志输出逐帧数据。
 
-**元数据保留范围**：原始逐帧陀螺仪、防抖、深度、镜头映射、GPS 轨迹和未知二进制块等不保证嵌入 JPG/MP4；ExifTool 不可识别的数据也不在 JSON 快照中。完整原始元数据仍保留在原片中。
+ExifTool 补充 SDK 未公开的标准拍摄时间等字段，复制目标格式支持的 EXIF/XMP/IPTC 或 QuickTime 字段，并写入与回读核对预览的拍摄时间、相机信息、GPS 和全景标记。尺寸、方向与全景几何字段更新为预览实际值。MP4 保留可复制的 QuickTime 日期，拍摄时间同时写到 XMP；文件 mtime 跟随第一原片。
+
+InsMetaDataSDK 的 `GetFirstTimeStamp()` 是陀螺仪时间基准，不能作为拍摄日期。SDK 2.0.2 的 GPS `timestampMs` 字段名与头文件的秒单位注释存在歧义，因此轨迹保留原值，不猜测时间单位或转换成 UTC 日期。缺失的拍摄时间会记入日志，不从文件名或目录名推断。
+
+**元数据保留范围**：SDK 暴露的 GPS、陀螺仪、曝光、延时轨迹完整保存在单独的快照中，不保证嵌入 JPG/MP4。SDK 与 ExifTool 均未公开的防抖、深度、镜头映射和未知二进制数据仍保留在原片中。SDK 解析失败与单个轨迹不存在分别记录，不会把缺失数据写成有效的零值。
 
 ## GitHub 自动构建和 GHCR
 
@@ -166,7 +210,7 @@ docker compose -f compose.yaml -f compose.gpu.yaml up -d --no-build
 
 ## 开发与验证
 
-Python >= 3.10（3.10 还需 `tomli`，镜像通过系统包安装），运行时不需要 PyPI 依赖。在 Linux 安装 `ffmpeg` 和 `libimage-exiftool-perl` 后：
+Python >= 3.10（3.10 还需 `tomli`，镜像通过系统包安装），运行时不需要 PyPI 依赖。编译元数据适配器需 C++17 编译器；容器已包含 GCC。在 Linux 安装 `ffmpeg` 和 `libimage-exiftool-perl` 后：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -177,6 +221,8 @@ python3 -m converter --data-dir /绝对路径/data once
 ```
 
 测试覆盖镜头配对、孤立镜头、符号链接、输出冲突、上传等待、幂等、源文件变更、文件保护、重试、超时、中断和实例锁，以及真实媒体工具的时间、GPS、360 UUID 与音轨校验。自动化测试使用 SDK 测试替身，实际拼接质量与机型兼容性需要使用官方 SDK 和相机原片单独验证。
+
+本地提供官方元数据适配器时，可通过 `INSTA360_METADATA_READER=/绝对路径/bin/insta360-metadata` 启用真实 SDK 加载与非法输入测试。公开 CI 不保存 SDK；未提供该变量时，这项私有依赖测试明确跳过。
 
 ## 参考文档
 

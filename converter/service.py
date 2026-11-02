@@ -65,7 +65,7 @@ class Service:
             raise ValueError(f"Archive directory does not exist: {cfg.photo_root}")
         if cfg.photo_root.is_symlink():
             raise ValueError("photo_root must not be a symlink")
-        for name in (cfg.exiftool, cfg.ffprobe, cfg.executable):
+        for name in (cfg.exiftool, cfg.ffprobe, cfg.executable, cfg.metadata_reader):
             if shutil.which(name) is None:
                 raise ValueError(f"Required executable is missing or not executable: {name}")
         if not Path(cfg.executable).is_absolute():
@@ -74,6 +74,7 @@ class Service:
             raise ValueError(f"SDK models directory does not exist: {cfg.models}")
         self.runner.run([cfg.exiftool, "-ver"])
         self.runner.run([cfg.ffprobe, "-version"])
+        self.media.metadata_sdk.doctor()
         # Run the actual SDK executable so unresolved .so files and GPU failures
         # are discovered before the daemon appears to be working.
         env = os.environ.copy()
@@ -94,7 +95,9 @@ class Service:
             "本文件说明预览处理情况；原始文件未删除或改写。\n"
             "成功时生成 2:1 等距柱状全景，JPG 使用 GPano，MP4 使用 GSpherical 标记。\n"
             "仅复制目标格式支持的元数据；专有防抖/逐帧/GPS轨迹等不保证嵌入预览。\n"
-            "可读取的源元数据快照保存在 /data/metadata；完整原始元数据仍在原片中。\n\n"
+            "官方 InsMetaDataSDK 读取的相机、GPS、陀螺仪、曝光及延时数据保存在 /data/metadata。\n"
+            "拍摄日期由标准元数据补充，陀螺仪时间基准不作为拍摄日期。\n"
+            "完整原始元数据仍在原片中。\n\n"
         ) + json.dumps({"status": status, "time": datetime.now().astimezone().isoformat(),
                         "run_id": self.audit.run_id, "sources": job.sources, "preview": job.output,
                         "event": event, **detail}, ensure_ascii=False, indent=2, default=str) + "\n"
@@ -132,7 +135,7 @@ class Service:
         metadata_dir.mkdir(exist_ok=True)
         for index, source in enumerate(job.sources):
             hashes.append({"path": str(source), "sha256": digest(source, self.audit)})
-            metadata = self.media.metadata(source)
+            metadata = self.media.source_metadata(source, f"{fingerprint}-{index}")
             original_metadata.append(metadata)
             target = metadata_dir / f"{fingerprint}-{index}.json"
             self.audit.emit("file.write_metadata_snapshot", source=source, destination=target)

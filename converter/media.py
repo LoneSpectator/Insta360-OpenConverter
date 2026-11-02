@@ -2,6 +2,10 @@ import json
 import os
 from pathlib import Path
 import re
+import tempfile
+import uuid
+
+from .metadata import MetadataSDK
 
 
 def pick(metadata, *names):
@@ -18,13 +22,27 @@ def capture_fields(metadata):
     offset = pick(metadata, "ExifIFD:OffsetTimeOriginal")
     if date and offset and not re.search(r"(?:Z|[+-]\d{2}:?\d{2})$", str(date)):
         date = str(date) + str(offset)
-    return {
+    fields = {
         "DateTimeOriginal": date,
         "Make": pick(metadata, "IFD0:Make", "Keys:Make", "XMP-tiff:Make", "Insta360:Make"),
         "Model": pick(metadata, "IFD0:Model", "Keys:Model", "XMP-tiff:Model", "Insta360:Model"),
         "GPSLatitude": pick(metadata, "Composite:GPSLatitude", "XMP-exif:GPSLatitude", "GPS:GPSLatitude"),
         "GPSLongitude": pick(metadata, "Composite:GPSLongitude", "XMP-exif:GPSLongitude", "GPS:GPSLongitude"),
+        "SerialNumber": pick(metadata, "XMP-aux:SerialNumber", "ExifIFD:SerialNumber"),
+        "Firmware": pick(metadata, "XMP-aux:Firmware"),
     }
+    sdk = metadata.get("Insta360SDK", {})
+    if sdk.get("camera_type"):
+        fields.update(Make="Insta360", Model=sdk["camera_type"])
+    if sdk.get("serial_number"):
+        fields["SerialNumber"] = sdk["serial_number"]
+    if sdk.get("firmware_version"):
+        fields["Firmware"] = sdk["firmware_version"]
+    gps = sdk.get("first_valid_gps")
+    if gps:
+        fields.update(GPSLatitude=gps["latitude"], GPSLongitude=gps["longitude"])
+    # GetFirstTimeStamp is a gyro origin, never a date or a UTC epoch.
+    return fields
 
 
 def canonical_time(value):
@@ -35,6 +53,29 @@ def canonical_time(value):
 class Media:
     def __init__(self, cfg, runner, audit):
         self.cfg, self.runner, self.audit = cfg, runner, audit
+        self.metadata_sdk = MetadataSDK(cfg, runner, audit)
+
+    def source_metadata(self, path, token):
+        root = self.cfg.data_root / "metadata"
+        root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".insta360-metadata-", dir=root) as directory:
+            temporary = Path(directory)
+            sdk = self.metadata_sdk.extract(path, temporary)
+            standard = self.metadata(path)
+            target = root / f"{token}.sdk-{uuid.uuid4().hex}"
+            for file in temporary.iterdir():
+                with file.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            self.audit.emit("file.publish_sdk_snapshot", source=temporary, destination=target)
+            os.rename(temporary, target)
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        sdk["snapshot_directory"] = str(target)
+        standard["Insta360SDK"] = sdk
+        return standard
 
     def metadata(self, path):
         result = json.loads(self.runner.run([
@@ -110,7 +151,8 @@ class Media:
                        "-XMP-tiff:Orientation=1"]
         for key, group in [("DateTimeOriginal", "XMP-exif"), ("Make", "XMP-tiff"),
                            ("Model", "XMP-tiff"), ("GPSLatitude", "XMP-exif"),
-                           ("GPSLongitude", "XMP-exif")]:
+                           ("GPSLongitude", "XMP-exif"), ("SerialNumber", "XMP-aux"),
+                           ("Firmware", "XMP-aux")]:
             if fields[key] is not None:
                 assignments.append(f"-{group}:{key}={fields[key]}")
         if fields["DateTimeOriginal"]:
@@ -143,7 +185,8 @@ class Media:
         for key, expected in fields.items():
             if expected is None:
                 continue
-            group_name = "XMP-tiff" if key in ("Make", "Model") else "XMP-exif"
+            group_name = ("XMP-tiff" if key in ("Make", "Model") else
+                          "XMP-aux" if key in ("SerialNumber", "Firmware") else "XMP-exif")
             value = actual.get(f"{group_name}:{key}")
             if key.startswith("GPS"):
                 same = value is not None and abs(float(value) - float(expected)) < 1e-6
