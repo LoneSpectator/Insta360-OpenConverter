@@ -39,7 +39,7 @@ def main(argv=None):
         config_path = args.config or args.data_dir / "config.toml"
         cfg = Config.load(config_path, args.data_dir)
         audit.emit("service.start", command=args.command, config_path=config_path,
-                   config_fingerprint=cfg.fingerprint(), mode=cfg.mode)
+                   config_fingerprint=cfg.fingerprint(), mode="gpu")
         runner = Runner(audit, stop, cfg.command_timeout)
         if args.command == "metadata":
             source = args.source.absolute()

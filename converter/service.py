@@ -85,7 +85,7 @@ class Service:
                                     accepted_returncodes=(0, 1, 255))
         if "-inputs" not in help_text or "-output" not in help_text:
             raise ValueError("SDK command line did not report the expected -inputs / -output interface")
-        self.audit.emit("doctor.passed", mode=cfg.mode, archive=cfg.photo_root,
+        self.audit.emit("doctor.passed", mode="gpu", archive=cfg.photo_root,
                         note="Dependency check only; real stitching also needs a camera sample")
 
     def report(self, job, status, **detail):

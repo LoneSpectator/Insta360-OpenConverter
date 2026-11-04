@@ -101,10 +101,6 @@ class Media:
             argv.extend(["-bitrate", str(cfg.bitrate)])
             if cfg.codec == "h265":
                 argv.append("-enable_h265_encoder")
-        if cfg.mode == "cpu":
-            argv.extend(["-disable_cuda", "-image_processing_accel", "cpu"])
-            if output.suffix == ".mp4":
-                argv.extend(["-enable_soft_encode", "-enable_soft_decode"])
         argv.extend(cfg.extra_args)
         env = os.environ.copy()
         libraries = cfg.library_dirs + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])

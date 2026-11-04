@@ -17,10 +17,6 @@ camera_accessory_type = 0
 executable = "/data/sdk/media/bin/MediaSDKTest"
 models = "/data/sdk/media/bin/models"
 library_dirs = ["/data/sdk/media/lib", "/data/sdk/media/bin"]
-# 当前提供的 MediaSDK 3.1.5 必须使用 GPU。
-mode = "gpu"
-# 只有官方明确确认该包支持 CPU，且验证过其命令行接口后才能改为 true。
-cpu_compatible = false
 extra_args = []
 
 [tools]

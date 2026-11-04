@@ -85,12 +85,15 @@ class ScannerTests(Workspace):
         self.file("same.lrv")
         self.assertTrue(all(j.blocked for j in scan(self.photo, self.audit)))
 
-    def test_cpu_requires_explicit_compatible_sdk(self):
-        self.cfg.mode = "cpu"
-        with self.assertRaisesRegex(ValueError, "requires GPU"):
-            self.cfg.validate()
-        self.cfg.cpu_compatible = True
-        self.cfg.validate()
+    def test_legacy_cpu_configuration_is_rejected(self):
+        config = self.data / "config.toml"
+        for setting in ('mode = "cpu"', 'mode = "gpu"', "cpu_compatible = true"):
+            with self.subTest(setting=setting):
+                config.write_text("\n".join([
+                    f"photo_root = {json.dumps(str(self.photo))}", "[sdk]", setting, "",
+                ]), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "Unknown configuration keys"):
+                    Config.load(config, self.data)
 
     def test_invalid_dimensions_and_overlapping_roots(self):
         self.cfg.width = 127
@@ -105,6 +108,34 @@ class ScannerTests(Workspace):
         self.cfg.extra_args = ["-output", "/photo/source.insv"]
         with self.assertRaisesRegex(ValueError, "override"):
             self.cfg.validate()
+
+    def test_extra_arguments_cannot_override_gpu_processing(self):
+        for prefix in ("-", "--"):
+            arguments_list = [[prefix + "disable_cuda"]]
+            for value in ("true", "false"):
+                arguments_list.extend([
+                    [prefix + "disable_cuda", value],
+                    [prefix + "disable_cuda=" + value],
+                ])
+            for value in ("cpu", "CPU", "Cpu"):
+                arguments_list.extend([
+                    [prefix + "image_processing_accel", value],
+                    [prefix + "image_processing_accel=" + value],
+                ])
+            for arguments in arguments_list:
+                with self.subTest(arguments=arguments):
+                    self.cfg.extra_args = arguments
+                    with self.assertRaises(ValueError):
+                        self.cfg.validate()
+
+    def test_gpu_processing_allows_software_codecs_and_auto_acceleration(self):
+        for prefix in ("-", "--"):
+            for arguments in ([prefix + "enable_soft_encode", prefix + "enable_soft_decode"],
+                              [prefix + "image_processing_accel", "auto"],
+                              [prefix + "image_processing_accel=auto"]):
+                with self.subTest(arguments=arguments):
+                    self.cfg.extra_args = arguments
+                    self.cfg.validate()
 
 
 class RunnerTests(unittest.TestCase):
@@ -364,16 +395,17 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         with self.assertRaisesRegex(RuntimeError, "Another converter"):
             Service(self.cfg, self.audit, self.runner)
 
-    def test_cpu_command_is_explicit(self):
-        self.cfg.mode = "cpu"
-        self.cfg.cpu_compatible = True
-        source = self.source("cpu.lrv")
+    def test_default_conversion_uses_sdk_gpu_processing(self):
+        source = self.source("gpu-default.lrv")
         self.assertEqual(self.service.scan_once()["success"], 1)
+        self.assertTrue(Job((source,)).output.is_file())
         commands = [fields["argv"] for event, fields in self.audit.events
                     if event == "command.start" and fields["argv"][0] == str(self.sdk)]
-        self.assertIn("-enable_soft_encode", commands[0])
-        self.assertIn("-disable_cuda", commands[0])
-        self.assertIn("cpu", commands[0])
+        self.assertEqual(len(commands), 1)
+        arguments = {argument.split("=", 1)[0].lstrip("-") for argument in commands[0]}
+        self.assertTrue(arguments.isdisjoint({
+            "disable_cuda", "image_processing_accel", "enable_soft_encode", "enable_soft_decode",
+        }))
 
     def test_cli_watch_writes_audit_and_stops_cleanly(self):
         source = self.source("cli.insp")

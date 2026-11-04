@@ -28,8 +28,6 @@ class Config:
     models: str = "/data/sdk/media/bin/models"
     library_dirs: list[str] = field(default_factory=lambda: [
         "/data/sdk/media/lib", "/data/sdk/media/bin"])
-    mode: str = "gpu"
-    cpu_compatible: bool = False
     extra_args: list[str] = field(default_factory=list)
     exiftool: str = "exiftool"
     ffprobe: str = "ffprobe"
@@ -43,10 +41,10 @@ class Config:
         tools = raw.pop("tools", {})
         metadata = raw.pop("metadata", {})
         top_keys = set(cls.__dataclass_fields__) - {
-            "data_root", "executable", "models", "library_dirs", "mode",
-            "cpu_compatible", "extra_args", "exiftool", "ffprobe", "metadata_reader", "metadata_library_dirs"}
+            "data_root", "executable", "models", "library_dirs",
+            "extra_args", "exiftool", "ffprobe", "metadata_reader", "metadata_library_dirs"}
         for obj, allowed in [(raw, top_keys), (sdk, {
-            "executable", "models", "library_dirs", "mode", "cpu_compatible", "extra_args"
+            "executable", "models", "library_dirs", "extra_args"
         }), (tools, {"exiftool", "ffprobe"}), (metadata, {"reader", "library_dirs"})]:
             unknown = set(obj) - allowed
             if unknown:
@@ -69,14 +67,10 @@ class Config:
         if self.codec not in ("h264", "h265") or self.stitch_type not in (
                 "optflow", "dynamicstitch", "aistitch"):
             raise ValueError("Invalid codec or stitch_type")
-        if type(self.flowstate) is not bool or type(self.cpu_compatible) is not bool:
-            raise ValueError("flowstate and sdk.cpu_compatible must be booleans")
+        if type(self.flowstate) is not bool:
+            raise ValueError("flowstate must be a boolean")
         if type(self.camera_accessory_type) is not int or not 0 <= self.camera_accessory_type <= 20:
             raise ValueError("camera_accessory_type must be an SDK accessory enum value (0..20)")
-        if self.mode not in ("gpu", "cpu"):
-            raise ValueError("sdk.mode must be gpu or cpu")
-        if self.mode == "cpu" and not self.cpu_compatible:
-            raise ValueError("MediaSDK 3.x requires GPU. Obtain an official CPU-compatible SDK first.")
         if not self.photo_root.is_absolute() or not self.data_root.is_absolute():
             raise ValueError("photo_root and data directory must be absolute")
         photo, data = self.photo_root.resolve(), self.data_root.resolve()
@@ -99,6 +93,16 @@ class Config:
         reserved = {"inputs", "output", "image_sequence_dir", "export_frame_index", "output_size"}
         if any(arg.split("=", 1)[0].lstrip("-") in reserved for arg in self.extra_args):
             raise ValueError("sdk.extra_args must not override input/output paths or output geometry")
+        for index, arg in enumerate(self.extra_args):
+            option, separator, value = arg.partition("=")
+            option = option.lstrip("-").lower()
+            if option == "disable_cuda":
+                raise ValueError("GPU rendering is required; disabling CUDA is not supported")
+            if option == "image_processing_accel":
+                if not separator and index + 1 < len(self.extra_args):
+                    value = self.extra_args[index + 1]
+                if value.strip().lower() == "cpu":
+                    raise ValueError("GPU rendering is required; CPU rendering is not supported")
 
     def fingerprint(self):
         values = asdict(self)

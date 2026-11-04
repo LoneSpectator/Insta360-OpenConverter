@@ -16,13 +16,12 @@
 | 项目 | 要求或状态 |
 | --- | --- |
 | 平台 | Linux x86_64；容器基于 Ubuntu 22.04，镜像架构为 `linux/amd64` |
-| 容器环境 | Docker Engine、Compose v2；GPU 部署需 NVIDIA Container Toolkit |
+| 容器环境 | Docker Engine、Compose v2、NVIDIA Container Toolkit |
 | SDK | 官方 Linux x86_64 MediaSDK（拼接）和 InsMetaDataSDK（元数据读取），分别获取并只读挂载 |
-| GPU | 默认使用 NVIDIA GPU；驱动需兼容 SDK 包内 CUDA 运行时，具体版本以 SDK 文档为准 |
-| CPU | 尚未完成兼容性验证；需要支持 CPU 的官方 SDK 和对应命令行接口 |
+| GPU | NVIDIA GPU；驱动需兼容 SDK 包内 CUDA 运行时，具体版本以 SDK 文档为准 |
 | 文件系统 | 档案目录可读写，支持硬链接和原子重命名；SDK 目录可读取和执行 |
 
-官方 [Desktop 指南](https://github.com/Insta360Develop/Insta360-Developer_Docs/blob/main/docs/ch/sdk/x-ace-go/desktop/guide.md) 要求 **MediaSDK 3.x 使用独立 GPU**，软件编解码选项不构成纯 CPU 拼接支持。InsMetaDataSDK 元数据读取可独立运行，不需要 MediaSDK 或 GPU。离线文件处理不依赖 CameraSDK。
+官方 [Desktop 指南](https://github.com/Insta360Develop/Insta360-Developer_Docs/blob/main/docs/ch/sdk/x-ace-go/desktop/guide.md) 要求 **MediaSDK 3.x 使用独立 GPU**，本项目统一使用 NVIDIA GPU 部署。InsMetaDataSDK 元数据读取本身不调用 MediaSDK，容器仍使用同一 GPU 配置。离线文件处理不依赖 CameraSDK。
 
 **验证状态**：自动化测试覆盖扫描、文件保护、SDK 字段映射、轨迹保存和 JPG/MP4 元数据回读。官方 InsMetaDataSDK 2.0.2 用于本地编译、加载和错误路径验证；公开 CI 的 SDK 调用使用测试替身。真实相机数据和 MediaSDK 拼接、机型/LRV 兼容性仍需原片验证。
 
@@ -57,19 +56,19 @@ python3 scripts/prepare_metadata_sdk.py \
     ./sdk/metadata
 ```
 
-建议使用容器内的编译环境，以匹配运行镜像。完成下方 `.env` 配置后，先构建镜像，再挂载归档所在目录与 SDK 输出目录：
+建议使用 GHCR 镜像内的编译环境，以匹配运行镜像。拉取镜像后，挂载归档所在目录与 SDK 输出目录：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml build
+docker pull ghcr.io/lonespectator/insta360-openconverter:latest
 docker run --rm --user "$(id -u):$(id -g)" \
     --mount "type=bind,src=$PWD/sdk,dst=/sdk" \
     --mount "type=bind,src=/path/to/sdk-archives,dst=/archives,readonly" \
-    --entrypoint python3 insta360-openconverter:local \
+    --entrypoint python3 ghcr.io/lonespectator/insta360-openconverter:latest \
     /app/scripts/prepare_metadata_sdk.py \
     /archives/InsMetaDataSDK-linux64.tar.gz /sdk/metadata
 ```
 
-归档路径替换为实际位置；使用 GHCR 镜像时将命令中的本地镜像名替换为对应镜像。准备结果包含 `bin/insta360-metadata`、官方头文件和 `lib/libInsMetaDataSDK.so`，并用 `build.json` 记录归档、适配器源码和二进制的 SHA256。SDK 及编译结果留在本地 `sdk/metadata`，由 Compose 只读挂载，不参与公开镜像构建。
+归档路径替换为实际位置。准备结果包含 `bin/insta360-metadata`、官方头文件和 `lib/libInsMetaDataSDK.so`，并用 `build.json` 记录归档、适配器源码和二进制的 SHA256。SDK 及编译结果留在本地 `sdk/metadata`，由 Compose 只读挂载，不参与公开镜像构建。
 
 编辑 `.env`：
 
@@ -86,15 +85,17 @@ NVIDIA_GPU_ID=0
 
 通过 `nvidia-smi -L` 查看设备，在 `.env` 中将 `NVIDIA_GPU_ID` 设置为索引（如 `1`）或完整 UUID（如 `GPU-xxxxxxxx-…`）。推荐使用不受索引排序影响的 UUID。Compose 通过 `device_ids` 只分配选中的一张 GPU。
 
-### 构建和启动
+### 拉取镜像和启动
+
+默认使用 GitHub Actions 自动构建并发布的 `ghcr.io/lonespectator/insta360-openconverter:latest` 镜像。所有部署命令使用仓库中的 `docker-compose.yml`：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml build
+docker compose pull converter
 # 检查依赖、SDK 动态库和命令行接口。
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm converter doctor
+docker compose run --rm converter doctor
 # 扫描一遍；首次部署建议使用小规模测试档案。
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm converter once
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --force-recreate
+docker compose run --rm converter once
+docker compose up -d --force-recreate
 ```
 
 | 命令 | 行为 |
@@ -108,7 +109,7 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --force-rec
 
 修改配置或 GPU 设备后，重新运行上述 `up -d --force-recreate` 命令生效；仅修改配置无需重建镜像。
 
-独立元数据读取示例（无需 GPU override）：
+独立元数据读取示例（使用同一容器配置，不调用 MediaSDK）：
 
 ```bash
 docker compose run --rm converter metadata /photo/VID_sample.insv
@@ -120,6 +121,8 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
 
 配置文件为 `/data/config.toml`，完整示例见 [config.example.toml](config.example.toml)。
 
+升级时，请从已有配置中删除已移除的 `sdk.mode` 和 `sdk.cpu_compatible`，避免加载未知配置项失败。
+
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `photo_root` | `/photo` | 容器内档案根目录，需与挂载位置一致 |
@@ -130,11 +133,8 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
 | `width` / `height` | `3840` / `1920` | 预览尺寸，两边均为偶数，宽高比 2:1 |
 | `bitrate` | `20000000` | 视频输出码率，bps |
 | `codec` | `h264` | 视频编码，支持 `h264` / `h265` |
-| `sdk.mode` | `gpu` | SDK 执行模式 |
 | `metadata.reader` | `/data/sdk/metadata/bin/insta360-metadata` | 官方元数据 SDK 的本地适配器 |
 | `metadata.library_dirs` | `["/data/sdk/metadata/lib"]` | 元数据 SDK 运行库目录 |
-
-CPU 适配需要支持 CPU 的官方 SDK，并验证其软件编解码、CUDA 开关和 CPU 渲染参数。完成适配后设置 `sdk.mode = "cpu"`、`sdk.cpu_compatible = true`，仅使用 `docker-compose.yml` 部署。该配置开关不提供 SDK 本身缺失的 CPU 能力。
 
 ## 目录和处理规则
 
@@ -192,7 +192,7 @@ InsMetaDataSDK 的 `GetFirstTimeStamp()` 是陀螺仪时间基准，不能作为
 
 镜像地址：`ghcr.io/lonespectator/insta360-openconverter`。`main` 发布 `latest`、`main` 和 `sha-…`；`v0.1.0` 发布 `0.1.0`、`0.1` 和 `sha-…`。生产部署建议固定版本或镜像 digest。仓库需允许 GitHub Actions，包策略需允许工作流写入 GHCR。公开包支持匿名拉取，私有包需要先登录 GHCR。
 
-自动构建完成后，在 `.env` 设置：
+Compose 默认使用 GHCR 的 `latest` 镜像，也可在 `.env` 中通过 `CONVERTER_IMAGE` 指定版本或镜像 digest：
 
 ```dotenv
 CONVERTER_IMAGE=ghcr.io/lonespectator/insta360-openconverter:latest
@@ -201,16 +201,16 @@ CONVERTER_IMAGE=ghcr.io/lonespectator/insta360-openconverter:latest
 然后部署，无需本机构建：
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml pull converter
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm --no-build converter doctor
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --no-build
+docker compose pull converter
+docker compose run --rm converter doctor
+docker compose up -d
 ```
 
 镜像内包含应用和公共工具，SDK 从宿主机 `sdk/media` 挂载。SDK 压缩包、动态库、模型和授权文件不纳入公开仓库或默认镜像。
 
 ## 开发与验证
 
-格式约定见 [.editorconfig](.editorconfig)，统一使用 4 空格缩进。Compose 主配置命名为 `docker-compose.yml`，GPU 覆盖配置为 `docker-compose.gpu.yml`；JSON Lines 日志与轨迹保持一行一条记录。
+格式约定见 [.editorconfig](.editorconfig)，统一使用 4 空格缩进。Compose 配置统一命名为 `docker-compose.yml`；JSON Lines 日志与轨迹保持一行一条记录。
 
 Python >= 3.10（3.10 还需 `tomli`，镜像通过系统包安装），运行时不需要 PyPI 依赖。编译元数据适配器需 C++17 编译器；容器已包含 GCC。在 Linux 安装 `ffmpeg` 和 `libimage-exiftool-perl` 后：
 
