@@ -1,19 +1,16 @@
 import argparse
-import hashlib
-import json
 from pathlib import Path
 import signal
 import sys
 import threading
 import traceback
-import uuid
 
 from .audit import Audit, Cancelled, Runner
 from .bootstrap import prepare_sdks
 from .config import Config
 from .media import capture_fields
 from .scan import digest, snapshot
-from .service import Service, atomic_text
+from .service import Service
 
 
 def main(argv=None):
@@ -50,18 +47,12 @@ def main(argv=None):
             source = args.source.absolute()
             before = snapshot(source)
             source_sha = digest(source, audit)
-            token = hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest()
             media = service.media
             media.metadata_sdk.doctor()
-            metadata = media.source_metadata(source, token + "-inspect")
-            if snapshot(source) != before:
-                raise RuntimeError("Source changed during metadata extraction")
-            output = cfg.data_root / "metadata" / f"{token}-inspect-{uuid.uuid4().hex}.json"
-            audit.emit("file.write_metadata_snapshot", source=source, destination=output)
-            atomic_text(output, json.dumps(metadata, ensure_ascii=False, indent=4) + "\n")
+            metadata = media.source_metadata(source, before=before, source_sha256=source_sha)
+            output = metadata["Insta360SDK"]["snapshot_file"]
             audit.emit("metadata.inspect.complete", source=source, source_sha256=source_sha,
-                       snapshot=output, sdk_directory=metadata["Insta360SDK"]["snapshot_directory"],
-                       capture_fields=capture_fields(metadata))
+                       snapshot=output, capture_fields=capture_fields(metadata))
             return 0
         service.doctor()
         if args.command == "doctor":

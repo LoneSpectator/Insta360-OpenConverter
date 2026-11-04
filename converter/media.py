@@ -4,10 +4,11 @@ import os
 from pathlib import Path
 import re
 import tempfile
-import uuid
 
 from .metadata import MetadataSDK
 from .quality import build_plan, validate_output
+from .scan import digest, snapshot
+from .sidecar import MetadataSidecars
 
 
 def pick(metadata, *names):
@@ -53,31 +54,33 @@ def canonical_time(value):
 
 
 class Media:
-    def __init__(self, cfg, runner, audit):
+    def __init__(self, cfg, runner, audit, state=None):
         self.cfg, self.runner, self.audit = cfg, runner, audit
         self.metadata_sdk = MetadataSDK(cfg, runner, audit)
         self.sdk_help = None
+        self.sidecars = MetadataSidecars(state, audit, runner.stop) if state is not None else None
 
-    def source_metadata(self, path, token):
-        root = self.cfg.data_root / "metadata"
-        root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".insta360-metadata-", dir=root) as directory:
+    def source_metadata(self, path, before=None, source_sha256=None):
+        if self.sidecars is None:
+            raise RuntimeError("Source metadata publication requires the artifact registry")
+        before = before or snapshot(path)
+        if snapshot(path) != before:
+            raise RuntimeError("Source changed before metadata extraction")
+        source_sha256 = source_sha256 or digest(path, self.audit)
+        with tempfile.TemporaryDirectory(prefix=".insta360-metadata-", dir=path.parent) as directory:
             temporary = Path(directory)
-            sdk = self.metadata_sdk.extract(path, temporary)
-            standard = self.metadata(path)
-            target = root / f"{token}.sdk-{uuid.uuid4().hex}"
-            for file in temporary.iterdir():
-                with file.open("rb") as stream:
-                    os.fsync(stream.fileno())
-            self.audit.emit("file.publish_sdk_snapshot", source=temporary, destination=target)
-            os.rename(temporary, target)
-            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            self.audit.emit("file.create_temporary_directory", path=temporary)
             try:
-                os.fsync(descriptor)
+                sdk = self.metadata_sdk.extract(path, temporary)
+                standard = self.metadata(path)
+                standard["Insta360SDK"] = sdk
+                target = self.sidecars.save(path, standard, temporary, before, source_sha256)
             finally:
-                os.close(descriptor)
-        sdk["snapshot_directory"] = str(target)
-        standard["Insta360SDK"] = sdk
+                self.audit.emit("file.remove_temporary_directory", path=temporary)
+        sdk["snapshot_file"] = str(target)
+        for name, track in sdk["tracks"].items():
+            track.pop("file", None)
+            track["json_pointer"] = f"/Insta360SDK/tracks/{name}/records"
         return standard
 
     def metadata(self, path):

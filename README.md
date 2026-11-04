@@ -1,15 +1,16 @@
 # Insta360 OpenConverter
 
-面向 Linux x86_64 的 Insta360 全景预览转换服务。通过官方 **Insta360 MediaSDK** 递归处理指定目录中的 INSP、INSV 和 LRV，在原目录生成 `_preview.jpg` / `_preview.mp4`、处理说明和文件操作审计日志，保留原始文件。
+面向 Linux x86_64 的 Insta360 全景预览转换服务。通过官方 **Insta360 MediaSDK** 递归处理指定目录中的 INSP、INSV 和 LRV，在原目录生成 `_preview.jpg` / `_preview.mp4`、元数据 JSON 和处理说明，在 `/data/log` 保存文件操作审计日志，保留原始文件。
 
 ## 功能
 
 - 递归扫描多层指定目录，支持中文、空格和大小写扩展名。
 - INSP 转 JPG，INSV/LRV 转 MP4；自动配对双镜头视频文件。
 - 输出 2:1 全景预览，写入 GPano / GSpherical 标记，复制目标格式支持的拍摄元数据。
+- 在每个源文件旁保存 `<源文件主名>_metadata.json`，合并标准元数据、官方 SDK 字段和完整传感器轨迹。
 - 默认按源数据确定输出尺寸、视频编码和码率预算，校验输出帧率、位深及已知色彩信息。
 - 持久化处理状态，跳过未变文件，等待上传完成并重试失败任务。
-- 在原目录保存处理说明 TXT，在 `/data/log` 保存每次运行的详细审计日志。
+- 每个源文件所在目录共用一份 `insta360-preview-report.txt`，在 `/data/log` 保存每次运行的详细审计日志。
 - 通过 Docker Compose 部署，支持指定 NVIDIA GPU 索引或 UUID。
 - 启动时自动准备本地官方 SDK，校验缓存并在需要时重建。
 
@@ -104,7 +105,7 @@ docker compose up -d --force-recreate
 docker compose run --rm converter metadata /photo/VID_sample.insv
 ```
 
-结果保存在 `/data/metadata`，完成日志中的 `snapshot` 和 `sdk_directory` 分别指向汇总 JSON 与原始轨迹目录。源文件解析失败时返回错误，不会静默使用 ExifTool 代替官方 SDK。
+结果保存在源文件同目录的 `VID_sample_metadata.json` 中，与自动转换使用相同命名规则。完成日志中的 `snapshot` 指向该文件。源文件解析失败时返回错误，不会静默使用 ExifTool 代替官方 SDK。
 
 ### 转换配置
 
@@ -131,7 +132,7 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
 
 自动尺寸识别支持单个 2:1 主图像/视频流，以及双路同尺寸方形视频流；后者输出为单路宽度的两倍、高度不变。其他镜头布局需显式配置 `width` / `height`，无法确定时记录失败。源视频流缺少码率时，每个输入文件最多使用一次容器总码率估算；仍不可用时交由 SDK 使用源码率。相同码率只代表编码预算，不保证相同画质。
 
-转换后核对尺寸、视频编码、帧率、位深、色度采样和源文件中已知的色彩描述；不符合保留要求的产物不会发布。10-bit 视频使用 H.265，须由 SDK 明确提供 `-enable_10bit`，并通过实际输出检查。源探测结果、导出计划和实际输出参数写入处理说明 TXT 的 `quality` 字段及审计日志。
+转换后核对尺寸、视频编码、帧率、位深、色度采样和源文件中已知的色彩描述；不符合保留要求的产物不会发布。10-bit 视频使用 H.265，须由 SDK 明确提供 `-enable_10bit`，并通过实际输出检查。源探测结果、导出计划和实际输出参数写入目录处理说明中对应文件条目的 `quality` 字段及审计日志。
 
 全景拼接需要重投影和重新编码，MP4/JPG 输出不属于无损封装转换。程序默认不追加滤镜、降噪、增强或第二次 JPEG 编码；JPEG 质量由 SDK 内部控制，公开 CLI 未提供质量参数。SDK 可能仍执行其内部默认处理，例如部分演示版本默认启用且无法通过 CLI 关闭的 StitchFusion。实际画质和各机型兼容性需使用官方 SDK 与原片验证。
 
@@ -140,14 +141,15 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
 ```text
 /photo/
     活动档案/20261102.示例事件/
+        insta360-preview-report.txt           # 本目录所有原片的最新处理情况
         IMG_20261102_123456_00_001.insp          # 原片保留
+        IMG_20261102_123456_00_001_metadata.json
         IMG_20261102_123456_00_001_preview.jpg
-        IMG_20261102_123456_00_001.insp_preview.txt
         VID_20261102_123456_00_002.insv          # 双文件原片
+        VID_20261102_123456_00_002_metadata.json
         VID_20261102_123456_10_002.insv
+        VID_20261102_123456_10_002_metadata.json
         VID_20261102_123456_00_002_preview.mp4   # 一组只生成一份
-        VID_20261102_123456_00_002.insv_preview.txt
-        VID_20261102_123456_10_002.insv_preview.txt
 /sdk/                                       # 宿主机 sdk/，只读挂载
     MediaSDK*.tar*.gz                        # 官方包名匹配示例
     InsMetaDataSDK*.tar*.gz
@@ -156,13 +158,6 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
     state.sqlite3                           # 持久化处理状态和生成物归属
     converter.lock
     health.json                             # 最近完整扫描的结果及时间
-    metadata/<任务指纹>-<输入序号>.json         # SDK 与标准元数据汇总
-    metadata/<任务标识>.sdk-<唯一ID>/
-        sdk.json                              # 官方 SDK 原始字段、轨迹数量及可用状态
-        gps.jsonl                             # GPS 原始轨迹
-        gyro.jsonl                            # 陀螺仪与加速度
-        exposure.jsonl                        # 曝光与快门速度
-        timelapse.jsonl                       # 延时摄影时间戳
     log/<启动时间带时区>-<PID>.log             # 每次启动新建，JSON Lines
     sdk/                                    # 自动准备缓存、构建清单及临时文件
         media/                              # 解包整理后的 MediaSDK
@@ -170,24 +165,32 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
 ```
 
 - 扫描整个 `photo_root`，包括多层事件目录；`YYYYMMDD.事件名称` 用于说明文件中的事件识别，不限制更深层文件。大小写扩展名和中文/空格路径均支持。不跟随符号链接，也不扫描本工具的临时目录。
+- 每个实际包含原片的目录只生成一份 `insta360-preview-report.txt`，按原文件名汇总该目录直属原片的最新状态；再次处理时更新对应条目，保留其他文件的记录。双镜头配对的两个原片各有条目。更深层子目录使用各自的说明文件，不汇入上层目录。
 - INSP → JPG，INSV/LRV → MP4；同目录、同前缀、同序号、同扩展名的 `_00_` + `_10_` 文件成组输入 SDK。单文件/双视频轨素材直接交给 SDK 判断。孤立 `_10_` 等待配对。照片逐张处理，不擅自合并 HDR 曝光组。
+- 每个原片各有一个 `<源文件主名>_metadata.json`，主名不含原扩展名，例如 `VID_001.insv` 对应 `VID_001_metadata.json`。双文件视频的两个原片分别保存元数据。标准字段、SDK 汇总和四类轨迹合并为一个 JSON，不再另外保留轨迹目录。同目录存在主名相同、扩展名不同的原片时，元数据命名会冲突，程序报告冲突并保护已有文件。
 - LRV 作为独立输入处理；缺少 SDK 所需拼接信息时记录失败。同一拍摄产生的 VID 和 LRV 默认各有一份预览。
 - 上传时默认等待最后修改至少 120 秒；转码前记录大小、mtime、inode、SHA256，发布前再检查源文件属性。建议上传到扫描根目录外，完成后原子移入，避免上传过程中长时间暂停导致提前处理。
 - 先在同目录临时子目录中生成，检查导出画质参数、音轨、时长和关键元数据，然后同步落盘并原子发布。底层文件系统需支持硬链接（首次无覆盖发布）和原子重命名。中断后的残余 `.insta360-preview-*` 目录不会作为原片扫描，可结合日志在服务停止后人工清理。
-- 重复扫描通过 SQLite 跳过未变文件；源文件或转换配置改变后重新生成本工具拥有的预览。用户原有预览、被用户修改的预览和同名非本工具 TXT 不会被覆盖。删除预览可触发重建；**保留并备份 `/data/state.sqlite3`**，否则服务无法确认既有预览的归属，会拒绝覆盖。
+- 重复扫描通过 SQLite 跳过未变文件；源文件或转换配置改变后重新生成本工具拥有的产物。用户原有文件、被用户修改的预览或元数据 JSON，以及同名非本工具 TXT 不会被覆盖。删除预览可触发重建，缺失的元数据 JSON 会在后续扫描补回；**保留并备份 `/data/state.sqlite3`**，否则服务无法确认既有产物的归属，会拒绝覆盖。
 - 日志包含每条外部命令及退出码、SDK stdout/stderr、原片读取/哈希、元数据快照、临时文件、发布/替换/清理、等待/跳过/失败原因。日志仅追加，不自动轮转或删除；可由宿主机配置保留策略。日志和快照可能包含拍摄时间、GPS 和原始路径，请按档案权限管理。运行中更改 GPU 后需重建服务，不能只重启原容器。
 
 ## 元数据语义
 
 照片写入 Google **GPano**，视频写入视频轨内的 **GSpherical UUID**（Spherical Video v1）。全景画面为 2:1 单目等距柱状投影，播放效果取决于播放器对全景元数据的支持。
 
-源文件的相机型号、固件、序列号和传感器轨迹通过 **官方 InsMetaDataSDK** 读取。预览优先使用 SDK 相机字段和首个有效 GPS 点，按南北/东西标记处理坐标符号；完整原始轨迹单独保存为 JSON Lines，记录 SHA256、数量和 SDK 可用状态，避免日志输出逐帧数据。
+源文件的相机型号、固件、序列号和传感器轨迹通过 **官方 InsMetaDataSDK** 读取。预览优先使用 SDK 相机字段和首个有效 GPS 点，按南北/东西标记处理坐标符号。
+
+每个源文件旁的 `_metadata.json` 同时包含 ExifTool 标准字段、`Insta360SDK` 汇总，以及 GPS、陀螺仪与加速度、曝光、延时摄影轨迹。完整记录保存在 `Insta360SDK.tracks.<轨迹名>.records` 数组中，并保留数量、SDK 可用状态和原始轨迹的 SHA256 等信息。JSON 使用 4 空格缩进，轨迹逐条合并写入，长视频无需一次将全部记录加载到内存。SDK 中间文件仅存于源文件同目录的临时子目录，合并后清理；运行日志不输出逐帧轨迹。
+
+元数据名称均使用不含扩展名的源文件主名。同一原片的元数据采用一种存放形式：单文件为 `<源文件主名>_metadata.json`；需要多个文件时则全部放入 `<源文件主名>_metadata/`，目录外不再另留同名 JSON。当前支持的数据均可合并，因此只生成单个 JSON。若源文件旁已存在对应的 `_metadata` 目录，程序保留该目录并报告冲突，避免两种形式同时出现。
 
 ExifTool 补充 SDK 未公开的标准拍摄时间等字段，复制目标格式支持的 EXIF/XMP/IPTC 或 QuickTime 字段，并写入与回读核对预览的拍摄时间、相机信息、GPS 和全景标记。尺寸、方向与全景几何字段更新为预览实际值。MP4 保留可复制的 QuickTime 日期，拍摄时间同时写到 XMP；文件 mtime 跟随第一原片。
 
 InsMetaDataSDK 的 `GetFirstTimeStamp()` 是陀螺仪时间基准，不能作为拍摄日期。SDK 2.0.2 的 GPS `timestampMs` 字段名与头文件的秒单位注释存在歧义，因此轨迹保留原值，不猜测时间单位或转换成 UTC 日期。缺失的拍摄时间会记入日志，不从文件名或目录名推断。
 
-**元数据保留范围**：SDK 暴露的 GPS、陀螺仪、曝光、延时轨迹完整保存在单独的快照中，不保证嵌入 JPG/MP4。SDK 与 ExifTool 均未公开的防抖、深度、镜头映射和未知二进制数据仍保留在原片中。SDK 解析失败与单个轨迹不存在分别记录，不会把缺失数据写成有效的零值。
+**元数据保留范围**：SDK 暴露的 GPS、陀螺仪、曝光、延时轨迹完整保存在源文件旁的 JSON 中，不保证嵌入 JPG/MP4。SDK 与 ExifTool 均未公开的防抖、深度、镜头映射和未知二进制数据仍保留在原片中。SDK 解析失败与单个轨迹不存在分别记录，不会把缺失数据写成有效的零值。
+
+旧版本生成的 `/data/metadata` 历史文件和逐文件 `*_preview.txt` 说明不会自动删除。升级后，后续扫描会按新规则在源文件旁生成元数据 JSON，并按实际目录汇总处理说明；确认归档和备份后可自行整理历史文件。
 
 ## GitHub 自动构建和 GHCR
 
@@ -212,7 +215,7 @@ docker compose up -d
 
 ## 开发与验证
 
-格式约定见 [.editorconfig](.editorconfig)，统一使用 4 空格缩进。Compose 配置统一命名为 `docker-compose.yml`；JSON Lines 日志与轨迹保持一行一条记录。
+格式约定见 [.editorconfig](.editorconfig)，统一使用 4 空格缩进。Compose 配置统一命名为 `docker-compose.yml`；JSON Lines 审计日志保持一行一条记录。
 
 宿主机直接开发需 Python >= 3.10（3.10 还需 `tomli`），运行时不需要 PyPI 依赖。SDK 自动准备还需 `dpkg-deb` 和兼容运行环境的 C++17 编译器；部署镜像已包含这些工具。在 Linux 安装 `ffmpeg` 和 `libimage-exiftool-perl` 后：
 

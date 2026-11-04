@@ -1,4 +1,4 @@
-"""Official SDK extraction and lossless, separate sensor-track snapshots."""
+"""Official SDK extraction and validation of temporary sensor tracks."""
 import hashlib
 import json
 import math

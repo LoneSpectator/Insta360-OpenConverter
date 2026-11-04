@@ -1,5 +1,6 @@
 import io
 from contextlib import redirect_stdout
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ from converter.audit import Cancelled, Runner
 from converter.config import Config
 from converter.scan import Job, digest, scan
 from converter.service import Service
+from converter.sidecar import metadata_path
 from scripts.prepare_sdk import prepare, unpack
 
 
@@ -328,8 +330,10 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(output.stat().st_mtime_ns, original_time)
         self.assertEqual(self.service.scan_once()["skipped"], 1)
         self.assertFalse(list(self.event.glob(".insta360-preview-*")))
-        self.assertTrue(list((self.data / "metadata").glob("*.json")))
-        self.assertIn('"status": "success"', Job((source,)).report.read_text())
+        self.assertTrue(metadata_path(source).is_file())
+        self.assertFalse((self.data / "metadata").exists())
+        report = json.loads(Job((source,)).report.read_text().split("\n\n", 1)[1])
+        self.assertEqual(report["files"][source.name]["status"], "success")
 
     def test_video_gets_real_spherical_uuid_and_retains_audio(self):
         source = self.source("VID_20261102_00_001.insv")
@@ -355,12 +359,139 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(self.service.scan_once()["deferred"], 1)
         primary = self.source("VID_20261102_00_001.insv")
         self.assertEqual(self.service.scan_once()["success"], 1)
+        report = json.loads(Job((primary,)).report.read_text().split("\n\n", 1)[1])
         for source in (primary, secondary):
-            self.assertIn('"status": "success"', Job((source,)).report.read_text())
+            self.assertEqual(report["files"][source.name]["status"], "success")
+            self.assertTrue(metadata_path(source).is_file())
+        self.assertEqual(Job((primary,)).report, Job((secondary,)).report)
         self.assertEqual(len(list(self.event.glob("*_preview.mp4"))), 1)
         primary.unlink()
         self.assertEqual(self.service.scan_once()["deferred"], 1)
-        self.assertIn('"status": "deferred"', Job((secondary,)).report.read_text())
+        report = json.loads(Job((secondary,)).report.read_text().split("\n\n", 1)[1])
+        self.assertEqual(report["files"][secondary.name]["status"], "deferred")
+
+    def test_missing_secondary_metadata_is_repaired_without_reencoding_preview(self):
+        primary = self.source("VID_20261102_00_007.insv")
+        secondary = self.source("VID_20261102_10_007.insv")
+        self.assertEqual(self.service.scan_once()["success"], 1)
+        preview = Job((primary, secondary)).output
+        previous = (digest(preview), preview.stat().st_mtime_ns)
+        metadata_path(secondary).unlink()
+        with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
+            self.assertEqual(self.service.scan_once()["skipped"], 1)
+        self.assertTrue(metadata_path(primary).is_file())
+        self.assertTrue(metadata_path(secondary).is_file())
+        self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
+        self.assertEqual(len(list(self.event.glob("*_preview.mp4"))), 1)
+        self.assertTrue(any(event == "job.metadata_repaired" for event, _ in self.audit.events))
+        report = json.loads(Job((primary, secondary)).report.read_text().split("\n\n", 1)[1])
+        for source in (primary, secondary):
+            self.assertEqual(report["files"][source.name]["status"], "success")
+
+    def test_directory_report_merges_mixed_statuses_and_keeps_one_file_per_directory(self):
+        good = self.source("good.insp")
+        bad = self.source("bad.insv")
+        waiting = self.source("VID_20261102_10_008.insv")
+        nested = self.event / "nested"
+        nested.mkdir()
+        other = self.source("nested/other.insp")
+        counts = self.service.scan_once()
+        self.assertEqual((counts["success"], counts["failed"], counts["deferred"]), (2, 1, 1))
+        report_path = Job((good,)).report
+        report = json.loads(report_path.read_text().split("\n\n", 1)[1])
+        self.assertEqual(set(report["files"]), {good.name, bad.name, waiting.name})
+        self.assertEqual(report["files"][good.name]["status"], "success")
+        self.assertEqual(report["files"][bad.name]["status"], "failed")
+        self.assertEqual(report["files"][waiting.name]["status"], "deferred")
+        self.assertEqual(list(self.event.glob("*.txt")), [report_path])
+        other_report = Job((other,)).report
+        self.assertEqual(list(nested.glob("*.txt")), [other_report])
+        self.assertEqual(set(json.loads(other_report.read_text().split("\n\n", 1)[1])["files"]), {other.name})
+
+    def test_missing_directory_report_restores_all_skipped_successes_without_reencoding(self):
+        first = self.source("first.insp")
+        second = self.source("second.insp")
+        self.assertEqual(self.service.scan_once()["success"], 2)
+        report_path = Job((first,)).report
+        report_path.unlink()
+        with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
+            self.assertEqual(self.service.scan_once()["skipped"], 2)
+        report = json.loads(report_path.read_text().split("\n\n", 1)[1])
+        self.assertEqual(set(report["files"]), {first.name, second.name})
+        self.assertTrue(all(entry["status"] == "success" for entry in report["files"].values()))
+        self.assertEqual(list(self.event.glob("*.txt")), [report_path])
+
+    def test_same_stem_sources_are_blocked_before_metadata_name_collision(self):
+        image = self.source("same.insp")
+        video = self.source("same.insv")
+        counts = self.service.scan_once()
+        self.assertEqual((counts["success"], counts["failed"], counts["deferred"]), (0, 0, 2))
+        self.assertEqual(metadata_path(image).name, "same_metadata.json")
+        self.assertEqual(metadata_path(video), metadata_path(image))
+        report = json.loads(Job((image,)).report.read_text().split("\n\n", 1)[1])
+        for source in (image, video):
+            self.assertFalse(Job((source,)).output.exists())
+            self.assertEqual(report["files"][source.name]["status"], "deferred")
+            self.assertIn("metadata", report["files"][source.name]["reason"].lower())
+        self.assertFalse(metadata_path(image).exists())
+        self.assertFalse((self.data / "metadata").exists())
+
+    def test_old_metadata_storage_migrates_without_reencoding_completed_preview(self):
+        source = self.source("migration.insp")
+        self.assertEqual(self.service.scan_once()["success"], 1)
+        preview = Job((source,)).output
+        previous = (digest(preview), preview.stat().st_mtime_ns)
+        old = self.service.state.get(source)
+        detail = json.loads(old["detail"])
+        historical = self.data / "metadata" / "old-snapshot.json"
+        historical.parent.mkdir()
+        historical.write_text('{\n    "historical": true\n}\n', encoding="utf-8")
+        historical_bytes = historical.read_bytes()
+        detail["metadata_snapshots"] = [str(historical)]
+        detail.pop("metadata_info", None)
+        self.service.state.put(source, old["fingerprint"], "success", **detail)
+        metadata_path(source).unlink()
+        with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
+            self.assertEqual(self.service.scan_once()["skipped"], 1)
+        self.assertTrue(metadata_path(source).is_file())
+        self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
+        self.assertEqual(historical.read_bytes(), historical_bytes)
+        migrated = json.loads(self.service.state.get(source)["detail"])
+        self.assertEqual(migrated["metadata_snapshots"], [str(metadata_path(source))])
+
+    def test_failed_metadata_repair_retry_preserves_completed_preview_without_reencoding(self):
+        source = self.source("repair-retry.insp")
+        self.assertEqual(self.service.scan_once()["success"], 1)
+        preview = Job((source,)).output
+        previous = (digest(preview), preview.stat().st_mtime_ns)
+        metadata_path(source).unlink()
+        with patch.object(self.service.media, "source_metadata", side_effect=RuntimeError("Temporary SDK failure")):
+            self.assertEqual(self.service.scan_once()["failed"], 1)
+        self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
+        self.cfg.retry_seconds = 1
+        with patch("converter.service.time.time", return_value=time.time() + 5):
+            with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
+                self.assertEqual(self.service.scan_once()["skipped"], 1)
+        self.assertTrue(metadata_path(source).is_file())
+        self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
+        self.assertEqual(self.service.state.get(source)["status"], "success")
+
+    def test_externally_edited_metadata_is_preserved_and_reported_as_failure(self):
+        source = self.source("metadata-edited.insp")
+        self.assertEqual(self.service.scan_once()["success"], 1)
+        path = metadata_path(source)
+        path.write_text('{"operator_note": "preserve this change"}\n', encoding="utf-8")
+        previous = path.read_bytes()
+        preview = Job((source,)).output
+        preview_sha = digest(preview)
+        with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
+            self.assertEqual(self.service.scan_once()["failed"], 1)
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertEqual(digest(preview), preview_sha)
+        report = json.loads(Job((source,)).report.read_text().split("\n\n", 1)[1])
+        self.assertEqual(report["files"][source.name]["status"], "failed")
+        self.assertIn("externally changed metadata", report["files"][source.name]["error"])
+        self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
 
     def test_sdk_false_success_does_not_stop_other_files(self):
         bad = self.source("bad.insv")
@@ -411,6 +542,22 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
             self.assertEqual(self.service.scan_once()["failed"], 1)
         self.assertFalse(Job((source,)).output.exists())
         self.assertFalse(list(self.event.glob(".insta360-preview-*")))
+
+    def test_source_mutation_during_metadata_extraction_does_not_publish_json(self):
+        source = self.source("metadata-mutates.insv")
+        extract = self.service.media.metadata_sdk.extract
+
+        def mutate(path, directory):
+            result = extract(path, directory)
+            with path.open("ab") as file:
+                file.write(b"upload still in progress")
+            return result
+
+        with patch.object(self.service.media.metadata_sdk, "extract", mutate):
+            self.assertEqual(self.service.scan_once()["failed"], 1)
+        self.assertFalse(metadata_path(source).exists())
+        self.assertFalse(Job((source,)).output.exists())
+        self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
 
     def test_recent_files_wait_and_missing_preview_is_rebuilt(self):
         source = self.source("recent.insp")
@@ -494,22 +641,30 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertAlmostEqual(float(actual["XMP-exif:GPSLatitude"]), -31.1234567890123, places=8)
         self.assertAlmostEqual(float(actual["XMP-exif:GPSLongitude"]), -121.2345678901234, places=8)
         self.assertEqual(actual["XMP-exif:DateTimeOriginal"], "2024:06:01 12:34:56+08:00")
-        snapshot_path, = (self.data / "metadata").glob("*.json")
+        snapshot_path = metadata_path(source)
         sdk = json.loads(snapshot_path.read_text())["Insta360SDK"]
         self.assertEqual(sdk["gyro_first_timestamp_ms"], payload["gyro_first_timestamp_ms"])
-        directory = Path(sdk["snapshot_directory"])
         for name in ("gps", "gyro", "exposure", "timelapse"):
-            self.assertEqual(sdk["tracks"][name]["count"], 1)
-            values = [json.loads(line) for line in (directory / (name + ".jsonl")).read_text().splitlines()]
-            self.assertEqual(values, payload[name])
-            self.assertEqual(digest(directory / (name + ".jsonl")), sdk["tracks"][name]["sha256"])
+            track = sdk["tracks"][name]
+            self.assertEqual(track["count"], 1)
+            self.assertEqual(track["records"], payload[name])
+            self.assertEqual(track["json_pointer"], f"/Insta360SDK/tracks/{name}/records")
+            self.assertNotIn("file", track)
+            original_jsonl = "".join(json.dumps(value) + "\n" for value in payload[name]).encode()
+            self.assertEqual(track["sha256"], hashlib.sha256(original_jsonl).hexdigest())
+            self.assertEqual(track["bytes"], len(original_jsonl))
+        self.assertNotIn("snapshot_directory", sdk)
+        self.assertFalse((self.data / "metadata").exists())
+        self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
 
     def test_metadata_sdk_failure_is_not_replaced_with_an_exiftool_success(self):
         source = self.source("metadata-fail.insv")
         self.assertEqual(self.service.scan_once()["failed"], 1)
         self.assertFalse(Job((source,)).output.exists())
         self.assertIn("InsMetaDataSDK Parse failed", Job((source,)).report.read_text())
-        self.assertFalse(list((self.data / "metadata").glob(".insta360-metadata-*")))
+        self.assertFalse(metadata_path(source).exists())
+        self.assertFalse((self.data / "metadata").exists())
+        self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
 
     def test_gyro_origin_does_not_create_a_capture_date(self):
         source = self.event / "gyro-origin.insp"
@@ -529,13 +684,18 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
             "[tools]", f"exiftool = {json.dumps(EXIFTOOL)}", "[metadata]",
             f"reader = {json.dumps(str(self.metadata_sdk))}", "library_dirs = []", "",
         ]), encoding="utf-8")
-        result = subprocess.run([sys.executable, "-m", "converter", "--data-dir", str(data),
-                                 "metadata", str(source)], capture_output=True, text=True, timeout=20)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        metadata_file, = (data / "metadata").glob("*.json")
+        for _ in range(2):
+            result = subprocess.run([sys.executable, "-m", "converter", "--data-dir", str(data),
+                                     "metadata", str(source)], capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        metadata_file = metadata_path(source)
+        self.assertEqual(metadata_file.name, "inspect_metadata.json")
         metadata = json.loads(metadata_file.read_text())
         self.assertEqual(metadata["Insta360SDK"]["sdk"], "InsMetaDataSDK")
-        self.assertTrue(Path(metadata["Insta360SDK"]["snapshot_directory"]).is_dir())
+        self.assertEqual(metadata["OpenConverter"]["source_sha256"], before)
+        self.assertEqual(list(self.event.glob("*_metadata.json")), [metadata_file])
+        self.assertFalse((data / "metadata").exists())
+        self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
         self.assertEqual(digest(source), before)
         self.assertFalse(Job((source,)).output.exists())
 
@@ -551,7 +711,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(image["ExifIFD:ExifImageWidth"], 128)
         self.assertEqual(image["XMP-GPano:FullPanoHeightPixels"], 64)
         report = json.loads(Job((video,)).report.read_text().split("\n\n", 1)[1])
-        quality = report["quality"]
+        quality = report["files"][video.name]["quality"]
         self.assertEqual(quality["target"]["width"], 128)
         self.assertEqual(quality["target"]["height"], 64)
         self.assertEqual(quality["target"]["codec"], "h264")

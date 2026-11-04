@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import stat
 
+from .reports import REPORT_NAME
+
 
 VIDEO = {".insv", ".lrv"}
 PAIR = re.compile(r"^(.*)_(00|10)_(\d+)$", re.IGNORECASE)
@@ -46,12 +48,11 @@ class Job:
 
     @property
     def report(self):
-        # Include the original extension to avoid INSP/INSV report collisions.
-        return self.primary.with_name(self.primary.name + "_preview.txt")
+        return self.primary.parent / REPORT_NAME
 
     @property
     def reports(self):
-        return tuple(path.with_name(path.name + "_preview.txt") for path in self.sources)
+        return tuple(dict.fromkeys(path.parent / REPORT_NAME for path in self.sources))
 
     def fingerprint(self, config_fingerprint):
         sources = [snapshot(path) for path in self.sources]
@@ -60,6 +61,8 @@ class Job:
 
 
 def scan(root: Path, audit):
+    from .sidecar import metadata_path
+
     files = []
 
     def failed(error):
@@ -71,7 +74,7 @@ def scan(root: Path, audit):
         retained = []
         for name in sorted(dirs):
             path = base / name
-            if path.is_symlink() or name.startswith(".insta360-preview-"):
+            if path.is_symlink() or name.startswith((".insta360-preview-", ".insta360-metadata-")):
                 audit.emit("scan.skip_directory", path=path)
             else:
                 retained.append(name)
@@ -108,4 +111,12 @@ def scan(root: Path, audit):
         if len(owners) > 1:
             for job in owners:
                 job.blocked = f"Multiple sources would write the same preview: {output}"
+    metadata_outputs = {}
+    for job in jobs:
+        for source in job.sources:
+            metadata_outputs.setdefault(metadata_path(source), []).append(job)
+    for output, owners in metadata_outputs.items():
+        if len(owners) > 1:
+            for job in owners:
+                job.blocked = f"Multiple sources would write the same metadata: {output}"
     return sorted(jobs, key=lambda job: str(job.primary))

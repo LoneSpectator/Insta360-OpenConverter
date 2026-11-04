@@ -11,11 +11,10 @@ import traceback
 from .audit import Cancelled
 from .media import Media
 from .quality import build_plan, summarize
-from .scan import EVENT, digest, scan, snapshot
+from .reports import DirectoryReports
+from .scan import digest, scan, snapshot
+from .sidecar import metadata_path
 from .state import State
-
-
-REPORT_HEADER = "Insta360 OpenConverter report v1\n"
 
 
 def atomic_text(path: Path, text: str):
@@ -54,7 +53,8 @@ class Service:
             self.lock.close()
             raise RuntimeError("Another converter is using this /data directory")
         self.state = State(cfg.data_root / "state.sqlite3")
-        self.media = Media(cfg, runner, audit)
+        self.media = Media(cfg, runner, audit, state=self.state)
+        self.reports = DirectoryReports(audit)
 
     def close(self):
         self.state.close()
@@ -91,32 +91,35 @@ class Service:
                         note="Dependency check only; real stitching also needs a camera sample")
 
     def report(self, job, status, **detail):
-        self.check_reports(job)
-        event = next((p.name for p in job.primary.parents if EVENT.match(p.name)), None)
-        text = REPORT_HEADER + (
-            "本文件说明预览处理情况；原始文件未删除或改写。\n"
-            "成功时生成 2:1 等距柱状全景，JPG 使用 GPano，MP4 使用 GSpherical 标记。\n"
-            "默认按源尺寸、编码和码率预算导出，质量计划与成品参数见 quality 字段。\n"
-            "全景拼接需要重投影及重编码，不是无损转封装；不追加像素重编码。\n"
-            "仅复制目标格式支持的元数据；专有防抖/逐帧/GPS轨迹等不保证嵌入预览。\n"
-            "官方 InsMetaDataSDK 读取的相机、GPS、陀螺仪、曝光及延时数据保存在 /data/metadata。\n"
-            "拍摄日期由标准元数据补充，陀螺仪时间基准不作为拍摄日期。\n"
-            "完整原始元数据仍在原片中。\n\n"
-        ) + json.dumps({"status": status, "time": datetime.now().astimezone().isoformat(),
-                        "run_id": self.audit.run_id, "sources": job.sources, "preview": job.output,
-                        "event": event, **detail}, ensure_ascii=False, indent=4, default=str) + "\n"
-        for path in job.reports:
-            self.audit.emit("file.write_report", path=path, status=status)
-            atomic_text(path, text)
+        self.reports.write(job, status, **detail)
 
     def check_reports(self, job):
-        for path in job.reports:
-            if path.is_symlink():
-                raise RuntimeError(f"Refusing to replace report symlink: {path}")
-            if path.exists():
-                with path.open(encoding="utf-8") as file:
-                    if file.readline() != REPORT_HEADER:
-                        raise RuntimeError(f"Refusing to overwrite an unrelated text file: {path}")
+        self.reports.check(job)
+
+    def extract_metadata(self, job, sources):
+        hashes, paths, infos, originals = [], [], [], []
+        for source, before in zip(job.sources, sources):
+            sha = digest(source, self.audit)
+            metadata = self.media.source_metadata(source, before=before, source_sha256=sha)
+            target = metadata_path(source)
+            hashes.append({"path": str(source), "sha256": sha})
+            originals.append(metadata)
+            paths.append(str(target))
+            infos.append(snapshot(target))
+        return hashes, paths, infos, originals
+
+    def metadata_unchanged(self, job, detail):
+        paths = [metadata_path(source) for source in job.sources]
+        if detail.get("metadata_snapshots") != [str(path) for path in paths]:
+            return False
+        for path in paths:
+            counterpart = path.with_suffix("")
+            if counterpart.exists() or counterpart.is_symlink():
+                return False
+        try:
+            return [snapshot(path) for path in paths] == detail.get("metadata_info")
+        except (OSError, ValueError):
+            return False
 
     def _owned(self, output):
         if output.is_symlink():
@@ -134,17 +137,7 @@ class Service:
         # Check both destinations before invoking a potentially expensive SDK job.
         previous = self._owned(job.output)
         self.check_reports(job)
-        hashes, metadata_paths, original_metadata = [], [], []
-        metadata_dir = cfg.data_root / "metadata"
-        metadata_dir.mkdir(exist_ok=True)
-        for index, source in enumerate(job.sources):
-            hashes.append({"path": str(source), "sha256": digest(source, self.audit)})
-            metadata = self.media.source_metadata(source, f"{fingerprint}-{index}")
-            original_metadata.append(metadata)
-            target = metadata_dir / f"{fingerprint}-{index}.json"
-            self.audit.emit("file.write_metadata_snapshot", source=source, destination=target)
-            atomic_text(target, json.dumps(metadata, ensure_ascii=False, indent=4) + "\n")
-            metadata_paths.append(str(target))
+        hashes, metadata_paths, metadata_info, original_metadata = self.extract_metadata(job, sources)
         source_probes = [self.media.probe(path) for path in job.sources]
         plan = build_plan(cfg, source_probes, job.output.suffix == ".mp4")
         self.audit.emit("quality.plan", sources=[summarize(probe) for probe in source_probes], target=plan.record(),
@@ -190,6 +183,7 @@ class Service:
             self.state.published(job.output, sha)
             output_info = snapshot(job.output)
             detail = {"source_hashes": hashes, "metadata_snapshots": metadata_paths,
+                      "metadata_info": metadata_info,
                       "capture_fields": capture, "preview_sha256": sha, "output_info": output_info,
                       "quality": quality}
             self.report(job, "success", **detail)
@@ -212,6 +206,7 @@ class Service:
             if self.runner.stop.is_set():
                 raise Cancelled("Shutdown requested between jobs")
             fingerprint = "unreadable"
+            completed_detail = None
             try:
                 fingerprint, sources = job.fingerprint(config_fingerprint)
                 old = self.state.get(job.primary)
@@ -221,25 +216,45 @@ class Service:
                     counts["deferred"] += 1
                     self.audit.emit("job.deferred", sources=job.sources, reason=reason)
                     # Avoid rewriting explanatory text on every polling cycle.
-                    if not old or old["fingerprint"] != fingerprint or old["status"] != "deferred":
+                    if (not old or old["fingerprint"] != fingerprint or old["status"] != "deferred"
+                            or not self.reports.has(job, "deferred")):
                         self.report(job, "deferred", reason=reason)
                         self.state.put(job.primary, fingerprint, "deferred", reason=reason)
                     continue
                 if old and old["fingerprint"] == fingerprint:
-                    if old["status"] == "success":
-                        detail = json.loads(old["detail"])
+                    detail = json.loads(old["detail"])
+                    if old["status"] == "failed":
+                        completed_detail = detail.get("preview_detail")
+                        if time.time() - old["updated"] < self.cfg.retry_seconds:
+                            if not self.reports.has(job, "failed"):
+                                self.report(job, "failed", error=detail.get("error"))
+                            counts["failed"] += 1
+                            self.audit.emit("job.retry_delayed", source=job.primary, last_error=detail.get("error"))
+                            continue
+                    elif old["status"] == "success":
+                        completed_detail = detail
+                    if completed_detail:
+                        detail = dict(completed_detail)
                         if job.output.exists() and not job.output.is_symlink() and (
                                 snapshot(job.output) == detail.get("output_info")):
+                            self.check_reports(job)
+                            repaired = not self.metadata_unchanged(job, detail)
+                            if repaired:
+                                hashes, paths, infos, _ = self.extract_metadata(job, sources)
+                                if [snapshot(source) for source in job.sources] != sources:
+                                    raise RuntimeError("Source changed while repairing metadata")
+                                detail.update(source_hashes=hashes, metadata_snapshots=paths,
+                                              metadata_info=infos)
+                                self.audit.emit("job.metadata_repaired", sources=job.sources,
+                                                metadata_snapshots=paths)
                             # Re-create an accidentally removed explanatory report.
-                            if any(not path.exists() for path in job.reports):
+                            if repaired or not self.reports.has(job, "success"):
                                 self.report(job, "success", **detail)
+                            if repaired or old["status"] != "success":
+                                self.state.put(job.primary, fingerprint, "success", **detail)
                             self.audit.emit("job.skip_unchanged", source=job.primary, preview=job.output)
                             counts["skipped"] += 1
                             continue
-                    if old["status"] == "failed" and time.time() - old["updated"] < self.cfg.retry_seconds:
-                        counts["failed"] += 1
-                        self.audit.emit("job.retry_delayed", source=job.primary, last_error=json.loads(old["detail"]))
-                        continue
                 self.process(job, fingerprint, sources)
                 counts["success"] += 1
             except Cancelled:
@@ -248,7 +263,10 @@ class Service:
                 counts["failed"] += 1
                 self.audit.emit("job.failed", source=job.primary, error=str(error),
                                 error_type=type(error).__name__, traceback=traceback.format_exc())
-                self.state.put(job.primary, fingerprint, "failed", error=str(error))
+                failure = {"error": str(error)}
+                if completed_detail:
+                    failure["preview_detail"] = completed_detail
+                self.state.put(job.primary, fingerprint, "failed", **failure)
                 try:
                     self.report(job, "failed", error=str(error))
                 except Exception as report_error:
