@@ -76,7 +76,7 @@ NVIDIA_GPU_ID=0
 默认使用 GitHub Actions 自动构建并发布的 `ghcr.io/lonespectator/insta360-openconverter:latest` 镜像。所有部署命令使用仓库中的 `docker-compose.yml`：
 
 ```bash
-docker compose pull converter
+docker compose pull
 docker compose up -d --force-recreate
 ```
 
@@ -207,7 +207,7 @@ CONVERTER_IMAGE=ghcr.io/lonespectator/insta360-openconverter:latest
 然后部署，无需本机构建：
 
 ```bash
-docker compose pull converter
+docker compose pull
 docker compose up -d
 ```
 
