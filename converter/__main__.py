@@ -9,8 +9,9 @@ import traceback
 import uuid
 
 from .audit import Audit, Cancelled, Runner
+from .bootstrap import prepare_sdks
 from .config import Config
-from .media import Media, capture_fields
+from .media import capture_fields
 from .scan import digest, snapshot
 from .service import Service, atomic_text
 
@@ -41,12 +42,16 @@ def main(argv=None):
         audit.emit("service.start", command=args.command, config_path=config_path,
                    config_fingerprint=cfg.fingerprint(), mode="gpu")
         runner = Runner(audit, stop, cfg.command_timeout)
+        # Keep the operation lock for SDK preparation and every SDK user.
+        # A second command must not replace a runtime used by an active watch.
+        service = Service(cfg, audit, runner)
+        prepare_sdks(cfg, audit, runner, metadata_only=args.command == "metadata")
         if args.command == "metadata":
             source = args.source.absolute()
             before = snapshot(source)
             source_sha = digest(source, audit)
             token = hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest()
-            media = Media(cfg, runner, audit)
+            media = service.media
             media.metadata_sdk.doctor()
             metadata = media.source_metadata(source, token + "-inspect")
             if snapshot(source) != before:
@@ -58,7 +63,6 @@ def main(argv=None):
                        snapshot=output, sdk_directory=metadata["Insta360SDK"]["snapshot_directory"],
                        capture_fields=capture_fields(metadata))
             return 0
-        service = Service(cfg, audit, runner)
         service.doctor()
         if args.command == "doctor":
             return 0

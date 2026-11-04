@@ -17,17 +17,18 @@ class Config:
     settle_seconds: int = 120
     retry_seconds: int = 300
     command_timeout: int = 7200
-    width: int = 3840
-    height: int = 1920
-    bitrate: int = 20_000_000
-    codec: str = "h264"
-    flowstate: bool = True
+    width: int = 0
+    height: int = 0
+    bitrate: int = 0
+    codec: str = "source"
+    flowstate: bool = False
     stitch_type: str = "optflow"
     camera_accessory_type: int = 0
     executable: str = "/data/sdk/media/bin/MediaSDKTest"
     models: str = "/data/sdk/media/bin/models"
     library_dirs: list[str] = field(default_factory=lambda: [
         "/data/sdk/media/lib", "/data/sdk/media/bin"])
+    source_root: Path = Path("/sdk")
     extra_args: list[str] = field(default_factory=list)
     exiftool: str = "exiftool"
     ffprobe: str = "ffprobe"
@@ -41,10 +42,10 @@ class Config:
         tools = raw.pop("tools", {})
         metadata = raw.pop("metadata", {})
         top_keys = set(cls.__dataclass_fields__) - {
-            "data_root", "executable", "models", "library_dirs",
+            "data_root", "executable", "models", "library_dirs", "source_root",
             "extra_args", "exiftool", "ffprobe", "metadata_reader", "metadata_library_dirs"}
         for obj, allowed in [(raw, top_keys), (sdk, {
-            "executable", "models", "library_dirs", "extra_args"
+            "executable", "models", "library_dirs", "source_root", "extra_args"
         }), (tools, {"exiftool", "ffprobe"}), (metadata, {"reader", "library_dirs"})]:
             unknown = set(obj) - allowed
             if unknown:
@@ -52,19 +53,25 @@ class Config:
         metadata_fields = {"metadata_" + key: value for key, value in metadata.items()}
         cfg = cls(**raw, **sdk, **tools, **metadata_fields, data_root=data_root)
         cfg.photo_root = Path(cfg.photo_root)
+        cfg.source_root = Path(cfg.source_root)
         cfg.validate()
         return cfg
 
     def validate(self):
-        for key in ("scan_interval", "retry_seconds", "command_timeout", "width", "height", "bitrate"):
+        for key in ("scan_interval", "retry_seconds", "command_timeout"):
             value = getattr(self, key)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{key} must be a positive integer")
         if type(self.settle_seconds) is not int or self.settle_seconds < 0:
             raise ValueError("settle_seconds must be a nonnegative integer")
-        if self.width != 2 * self.height or self.width % 2 or self.height % 2:
-            raise ValueError("Output must have an even, 2:1 resolution")
-        if self.codec not in ("h264", "h265") or self.stitch_type not in (
+        for key in ("width", "height", "bitrate"):
+            if type(getattr(self, key)) is not int or getattr(self, key) < 0:
+                raise ValueError(f"{key} must be a nonnegative integer")
+        if (self.width, self.height) != (0, 0) and (
+                not self.width or not self.height or self.width != 2 * self.height
+                or self.width % 2 or self.height % 2):
+            raise ValueError("Use width=height=0 for source size, or an even 2:1 resolution")
+        if self.codec not in ("source", "h264", "h265") or self.stitch_type not in (
                 "optflow", "dynamicstitch", "aistitch"):
             raise ValueError("Invalid codec or stitch_type")
         if type(self.flowstate) is not bool:
@@ -73,6 +80,8 @@ class Config:
             raise ValueError("camera_accessory_type must be an SDK accessory enum value (0..20)")
         if not self.photo_root.is_absolute() or not self.data_root.is_absolute():
             raise ValueError("photo_root and data directory must be absolute")
+        if not isinstance(self.source_root, Path) or not self.source_root.is_absolute():
+            raise ValueError("sdk.source_root must be an absolute path")
         photo, data = self.photo_root.resolve(), self.data_root.resolve()
         if photo == data or photo in data.parents or data in photo.parents:
             raise ValueError("Photo and data directories must not overlap")
@@ -108,12 +117,18 @@ class Config:
         values = asdict(self)
         for key in ("scan_interval", "settle_seconds", "retry_seconds", "command_timeout", "data_root"):
             values.pop(key)
-        values["pipeline_version"] = 2
+        values["pipeline_version"] = 3
         # Replacing the local SDK also invalidates successful jobs.
         binary = Path(self.executable)
         if binary.is_file():
             stat = binary.stat()
             values["sdk_binary"] = [stat.st_size, stat.st_mtime_ns]
+        # Bootstrap manifests include all runtime files, including libraries
+        # and models, so an SDK update also invalidates completed previews.
+        for component in ("media", "metadata"):
+            manifest = self.data_root / "sdk" / component / ".insta360-bootstrap.json"
+            if manifest.is_file():
+                values[f"{component}_runtime"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
         for index, path in enumerate([Path(self.metadata_reader)] + [
                 Path(directory) / "libInsMetaDataSDK.so" for directory in self.metadata_library_dirs]):
             if path.is_file():

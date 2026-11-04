@@ -1,4 +1,5 @@
 import json
+from fractions import Fraction
 import os
 from pathlib import Path
 import re
@@ -6,6 +7,7 @@ import tempfile
 import uuid
 
 from .metadata import MetadataSDK
+from .quality import build_plan, validate_output
 
 
 def pick(metadata, *names):
@@ -54,6 +56,7 @@ class Media:
     def __init__(self, cfg, runner, audit):
         self.cfg, self.runner, self.audit = cfg, runner, audit
         self.metadata_sdk = MetadataSDK(cfg, runner, audit)
+        self.sdk_help = None
 
     def source_metadata(self, path, token):
         root = self.cfg.data_root / "metadata"
@@ -89,61 +92,69 @@ class Media:
             self.cfg.ffprobe, "-v", "error", "-show_streams", "-show_format",
             "-of", "json", path], capture=True))
 
-    def convert(self, job, output):
+    def convert(self, job, output, plan=None):
         cfg = self.cfg
+        if plan is None:
+            plan = build_plan(cfg, [self.probe(path) for path in job.sources], output.suffix == ".mp4")
         argv = [cfg.executable, "-inputs", *job.sources, "-output", output,
-                "-output_size", f"{cfg.width}x{cfg.height}", "-stitch_type", cfg.stitch_type,
+                "-output_size", f"{plan.width}x{plan.height}", "-stitch_type", cfg.stitch_type,
                 "-model_root_dir", cfg.models.rstrip("/") + "/",
                 "-camera_accessory_type", str(cfg.camera_accessory_type)]
         if cfg.flowstate:
             argv.append("-enable_flowstate")
         if output.suffix == ".mp4":
-            argv.extend(["-bitrate", str(cfg.bitrate)])
-            if cfg.codec == "h265":
+            argv.extend(["-bitrate", str(plan.bitrate)])
+            if plan.codec == "h265":
                 argv.append("-enable_h265_encoder")
+            if plan.bit_depth and plan.bit_depth > 8:
+                if self.sdk_help is None:
+                    self.sdk_help = self.runner.run([cfg.executable, "-help"], cwd=cfg.data_root,
+                        env=self.sdk_environment(), capture=True, accepted_returncodes=(0, 1, 255))
+                if "-enable_10bit" not in self.sdk_help:
+                    raise RuntimeError("This MediaSDK CLI cannot confirm 10-bit export; refusing to reduce bit depth")
+                argv.append("-enable_10bit")
         argv.extend(cfg.extra_args)
-        env = os.environ.copy()
-        libraries = cfg.library_dirs + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
-        env["LD_LIBRARY_PATH"] = ":".join(libraries)
-        # The SDK installation is mounted read-only. Relative auxiliary output
-        # must stay in this job's writable, audited temporary directory.
-        self.runner.run(argv, cwd=output.parent, env=env)
+        self.runner.run(argv, cwd=output.parent, env=self.sdk_environment())
         # Some official demo releases return 0 even after an SDK error callback.
         if not output.is_file() or output.is_symlink() or output.stat().st_size == 0:
             raise RuntimeError("SDK returned without a nonempty output file; inspect command.output logs")
 
-    def validate(self, path, source_probe=None):
+    def sdk_environment(self):
+        env = os.environ.copy()
+        libraries = self.cfg.library_dirs + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
+        env["LD_LIBRARY_PATH"] = ":".join(libraries)
+        return env
+
+    def validate(self, path, source_probe=None, plan=None):
         info = self.probe(path)
-        video = [stream for stream in info.get("streams", []) if stream["codec_type"] == "video"]
-        if len(video) != 1:
-            raise RuntimeError("Preview must contain exactly one stitched video/image stream")
-        stream = video[0]
-        if (stream["width"], stream["height"]) != (self.cfg.width, self.cfg.height):
-            raise RuntimeError(f"SDK output resolution does not match configured 2:1 size: {stream}")
+        if plan is None:
+            if source_probe is None:
+                raise ValueError("Output validation requires the source export plan")
+            plan = build_plan(self.cfg, [source_probe], path.suffix == ".mp4")
+        validate_output(plan, info, path.suffix == ".mp4")
         if path.suffix == ".mp4":
             duration = float(info.get("format", {}).get("duration", 0))
-            if duration <= 0:
-                raise RuntimeError("Preview video has no positive duration")
             if source_probe:
                 original = float(source_probe.get("format", {}).get("duration", 0))
-                if original and abs(duration - original) > max(2, original * 0.02):
+                fps = float(Fraction(plan.fps)) if plan.fps else 25
+                if original and abs(duration - original) > max(2 / fps, original * 0.01):
                     raise RuntimeError(f"Video duration mismatch: source={original}s, preview={duration}s")
                 audio = any(s["codec_type"] == "audio" for s in source_probe.get("streams", []))
                 if audio and not any(s["codec_type"] == "audio" for s in info.get("streams", [])):
                     raise RuntimeError("SDK discarded the source audio stream")
         return info
 
-    def preserve_metadata(self, source, output, original):
+    def preserve_metadata(self, source, output, original, plan):
         cfg = self.cfg
         argv = [cfg.exiftool, "-overwrite_original", "-TagsFromFile", source, "-XMP:all"]
         if output.suffix == ".jpg":
-            argv.extend(["-EXIF:all", "-IPTC:all"])
+            argv.extend(["-EXIF:all", "-IPTC:all", "-ICC_Profile"])
         else:
             argv.extend(["-QuickTime:CreateDate", "-QuickTime:ModifyDate",
                          "-Keys:CreationDate", "-Keys:GPSCoordinates", "-Keys:Make", "-Keys:Model"])
         self.runner.run([*argv, output])
         fields = capture_fields(original)
-        assignments = [f"-XMP-tiff:ImageWidth={cfg.width}", f"-XMP-tiff:ImageHeight={cfg.height}",
+        assignments = [f"-XMP-tiff:ImageWidth={plan.width}", f"-XMP-tiff:ImageHeight={plan.height}",
                        "-XMP-tiff:Orientation=1"]
         for key, group in [("DateTimeOriginal", "XMP-exif"), ("Make", "XMP-tiff"),
                            ("Model", "XMP-tiff"), ("GPSLatitude", "XMP-exif"),
@@ -158,18 +169,20 @@ class Media:
                             message="No readable capture time; not inferred from directory or mtime")
         group = "XMP-GPano" if output.suffix == ".jpg" else "XMP-GSpherical"
         if output.suffix == ".jpg":
-            assignments.extend(["-IFD0:Orientation=1", f"-ExifIFD:ExifImageWidth={cfg.width}",
-                                f"-ExifIFD:ExifImageHeight={cfg.height}",
+            assignments.extend(["-IFD0:Orientation=1", f"-ExifIFD:ExifImageWidth={plan.width}",
+                                f"-ExifIFD:ExifImageHeight={plan.height}",
+                                f"-IFD0:ImageWidth={plan.width}", f"-IFD0:ImageHeight={plan.height}",
+                                f"-XMP-exif:ExifImageWidth={plan.width}", f"-XMP-exif:ExifImageHeight={plan.height}",
                                 "-XMP-GPano:UsePanoramaViewer=True"])
         else:
             assignments.extend(["-XMP-GSpherical:Spherical=True", "-XMP-GSpherical:Stitched=True",
                                 "-XMP-GSpherical:StereoMode=mono",
                                 "-XMP-GSpherical:StitchingSoftware=Insta360 MediaSDK / OpenConverter"])
         assignments.extend([f"-{group}:ProjectionType=equirectangular",
-                            f"-{group}:FullPanoWidthPixels={cfg.width}",
-                            f"-{group}:FullPanoHeightPixels={cfg.height}",
-                            f"-{group}:CroppedAreaImageWidthPixels={cfg.width}",
-                            f"-{group}:CroppedAreaImageHeightPixels={cfg.height}",
+                            f"-{group}:FullPanoWidthPixels={plan.width}",
+                            f"-{group}:FullPanoHeightPixels={plan.height}",
+                            f"-{group}:CroppedAreaImageWidthPixels={plan.width}",
+                            f"-{group}:CroppedAreaImageHeightPixels={plan.height}",
                             f"-{group}:CroppedAreaLeftPixels=0", f"-{group}:CroppedAreaTopPixels=0"])
         self.runner.run([cfg.exiftool, "-overwrite_original", *assignments, output])
         actual = self.metadata(output)
@@ -178,6 +191,11 @@ class Media:
         boolean = "UsePanoramaViewer" if output.suffix == ".jpg" else "Spherical"
         if str(actual.get(f"{group}:{boolean}")).lower() not in ("true", "1"):
             raise RuntimeError("360° viewer metadata was not written")
+        if output.suffix == ".jpg":
+            for tag, expected in [("IFD0:ImageWidth", plan.width), ("IFD0:ImageHeight", plan.height),
+                                  ("ExifIFD:ExifImageWidth", plan.width), ("ExifIFD:ExifImageHeight", plan.height)]:
+                if actual.get(tag) != expected:
+                    raise RuntimeError(f"Preview image metadata size mismatch: {tag}")
         for key, expected in fields.items():
             if expected is None:
                 continue

@@ -5,15 +5,19 @@ scan_interval = 60
 settle_seconds = 120
 retry_seconds = 300
 command_timeout = 7200
-width = 3840
-height = 1920
-bitrate = 20000000
-codec = "h264"
-flowstate = true
+# 0/0 保留源对应的全景尺寸；显式正数才调整分辨率。
+width = 0
+height = 0
+# 0 沿用源视频码率预算，不固定压低码率。
+bitrate = 0
+codec = "source"
+flowstate = false
 stitch_type = "optflow"
 camera_accessory_type = 0
 
 [sdk]
+# 宿主机 sdk 目录只读挂载；放入官方 SDK 包，容器自动准备运行副本。
+source_root = "/sdk"
 executable = "/data/sdk/media/bin/MediaSDKTest"
 models = "/data/sdk/media/bin/models"
 library_dirs = ["/data/sdk/media/lib", "/data/sdk/media/bin"]

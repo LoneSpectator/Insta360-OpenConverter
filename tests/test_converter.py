@@ -1,4 +1,5 @@
 import io
+from contextlib import redirect_stdout
 import json
 import os
 from pathlib import Path
@@ -136,6 +137,36 @@ class ScannerTests(Workspace):
                 with self.subTest(arguments=arguments):
                     self.cfg.extra_args = arguments
                     self.cfg.validate()
+
+    def test_sdk_model_or_library_update_invalidates_completed_job_fingerprint(self):
+        binary = self.data / "sdk/media/bin/MediaSDKTest"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"unchanged executable")
+        self.cfg.executable = str(binary)
+        manifest = binary.parent.parent / ".insta360-bootstrap.json"
+        manifest.write_text(json.dumps({"runtime_sha256": "original models and libraries"}))
+        original = self.cfg.fingerprint()
+        manifest.write_text(json.dumps({"runtime_sha256": "updated models or libraries"}))
+        self.assertNotEqual(self.cfg.fingerprint(), original)
+        self.assertEqual(binary.read_bytes(), b"unchanged executable")
+
+
+class InstanceLockTests(Workspace):
+    def test_all_commands_lock_before_preparing_shared_sdk_runtimes(self):
+        from converter.__main__ import main
+        service = Service(self.cfg, self.audit, Runner(self.audit, threading.Event(), 1))
+        self.addCleanup(service.close)
+        (self.data / "config.toml").write_text(
+            "photo_root = " + json.dumps(str(self.photo)), encoding="utf-8")
+        for command in ("doctor", "once", "watch", "metadata"):
+            argv = ["--data-dir", str(self.data), command]
+            if command == "metadata":
+                argv.append(str(self.event / "test.insp"))
+            with self.subTest(command=command), patch("converter.__main__.prepare_sdks") as prepare:
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(argv), 1)
+                prepare.assert_not_called()
+        self.assertFalse((self.data / "sdk").exists())
 
 
 class RunnerTests(unittest.TestCase):
@@ -371,8 +402,8 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         source = self.source("mutate.insv")
         convert = self.service.media.convert
 
-        def mutate(job, output):
-            convert(job, output)
+        def mutate(job, output, plan=None):
+            convert(job, output, plan)
             with source.open("ab") as file:
                 file.write(b"upload still in progress")
 
@@ -507,6 +538,34 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertTrue(Path(metadata["Insta360SDK"]["snapshot_directory"]).is_dir())
         self.assertEqual(digest(source), before)
         self.assertFalse(Job((source,)).output.exists())
+
+    def test_source_quality_defaults_use_dynamic_size_and_record_actual_parameters(self):
+        self.cfg.width = self.cfg.height = 0
+        photo = self.source("original-size.insp")
+        video = self.source("original-rate.insv")
+        self.assertEqual(self.service.scan_once()["success"], 2)
+        self.assertEqual((self.cfg.width, self.cfg.height), (0, 0))
+        image = self.service.media.metadata(Job((photo,)).output)
+        self.assertEqual(image["XMP-GPano:FullPanoWidthPixels"], 128)
+        self.assertEqual(image["IFD0:ImageWidth"], 128)
+        self.assertEqual(image["ExifIFD:ExifImageWidth"], 128)
+        self.assertEqual(image["XMP-GPano:FullPanoHeightPixels"], 64)
+        report = json.loads(Job((video,)).report.read_text().split("\n\n", 1)[1])
+        quality = report["quality"]
+        self.assertEqual(quality["target"]["width"], 128)
+        self.assertEqual(quality["target"]["height"], 64)
+        self.assertEqual(quality["target"]["codec"], "h264")
+        self.assertEqual(quality["target"]["fps"], "10")
+        self.assertFalse(quality["flowstate"])
+        actual = quality["actual"]["streams"][0]
+        self.assertEqual(actual["width"], 128)
+        self.assertEqual(actual["fps"], "10")
+        commands = [fields["argv"] for event, fields in self.audit.events
+                    if event == "command.start" and fields["argv"][0] == str(self.sdk)]
+        self.assertTrue(all("-enable_flowstate" not in args for args in commands))
+        source_rate = self.service.media.probe(video)["streams"][0]["bit_rate"]
+        video_command = next(args for args in commands if str(video) in args)
+        self.assertEqual(video_command[video_command.index("-bitrate") + 1], source_rate)
 
 
 if __name__ == "__main__":

@@ -9,8 +9,7 @@ services:
         volumes:
             - ${PHOTO_DIR:?Set PHOTO_DIR in .env}:/photo
             - ./data:/data
-            - ./sdk/media:/data/sdk/media:ro
-            - ./sdk/metadata:/data/sdk/metadata:ro
+            - ./sdk:/sdk:ro
         read_only: true
         tmpfs:
             - /tmp:size=256m,mode=1777

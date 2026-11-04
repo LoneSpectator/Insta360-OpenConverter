@@ -10,6 +10,7 @@ import traceback
 
 from .audit import Cancelled
 from .media import Media
+from .quality import build_plan, summarize
 from .scan import EVENT, digest, scan, snapshot
 from .state import State
 
@@ -85,6 +86,7 @@ class Service:
                                     accepted_returncodes=(0, 1, 255))
         if "-inputs" not in help_text or "-output" not in help_text:
             raise ValueError("SDK command line did not report the expected -inputs / -output interface")
+        self.media.sdk_help = help_text
         self.audit.emit("doctor.passed", mode="gpu", archive=cfg.photo_root,
                         note="Dependency check only; real stitching also needs a camera sample")
 
@@ -94,6 +96,8 @@ class Service:
         text = REPORT_HEADER + (
             "本文件说明预览处理情况；原始文件未删除或改写。\n"
             "成功时生成 2:1 等距柱状全景，JPG 使用 GPano，MP4 使用 GSpherical 标记。\n"
+            "默认按源尺寸、编码和码率预算导出，质量计划与成品参数见 quality 字段。\n"
+            "全景拼接需要重投影及重编码，不是无损转封装；不追加像素重编码。\n"
             "仅复制目标格式支持的元数据；专有防抖/逐帧/GPS轨迹等不保证嵌入预览。\n"
             "官方 InsMetaDataSDK 读取的相机、GPS、陀螺仪、曝光及延时数据保存在 /data/metadata。\n"
             "拍摄日期由标准元数据补充，陀螺仪时间基准不作为拍摄日期。\n"
@@ -141,15 +145,25 @@ class Service:
             self.audit.emit("file.write_metadata_snapshot", source=source, destination=target)
             atomic_text(target, json.dumps(metadata, ensure_ascii=False, indent=4) + "\n")
             metadata_paths.append(str(target))
-        source_probe = self.media.probe(job.primary) if job.output.suffix == ".mp4" else None
+        source_probes = [self.media.probe(path) for path in job.sources]
+        plan = build_plan(cfg, source_probes, job.output.suffix == ".mp4")
+        self.audit.emit("quality.plan", sources=[summarize(probe) for probe in source_probes], target=plan.record(),
+                        notes=["Stitching requires reprojection and encoding; not lossless remuxing",
+                               "JPEG quality and hidden SDK stitching-fusion defaults remain SDK-controlled"])
+        source_probe = source_probes[0] if job.output.suffix == ".mp4" else None
         directory = Path(tempfile.mkdtemp(prefix=".insta360-preview-", dir=job.primary.parent))
         self.audit.emit("file.create_temporary_directory", path=directory)
         try:
             staged = directory / job.output.name
-            self.media.convert(job, staged)
-            self.media.validate(staged, source_probe)
-            capture = self.media.preserve_metadata(job.primary, staged, original_metadata[0])
-            self.media.validate(staged, source_probe)
+            self.media.convert(job, staged, plan)
+            self.media.validate(staged, source_probe, plan)
+            capture = self.media.preserve_metadata(job.primary, staged, original_metadata[0], plan)
+            actual = self.media.validate(staged, source_probe, plan)
+            quality = {"target": plan.record(), "sources": [summarize(probe) for probe in source_probes],
+                       "actual": summarize(actual), "flowstate": cfg.flowstate,
+                       "sdk_defaults": "JPEG quality and internal stitching fusion are SDK-controlled",
+                       "encoding": "One SDK export; metadata changes do not re-encode pixels"}
+            self.audit.emit("quality.verified", path=staged, **quality)
             if [snapshot(source) for source in job.sources] != sources:
                 raise RuntimeError("Source changed during conversion; staged preview discarded")
             os.utime(staged, ns=(sources[0]["mtime_ns"], sources[0]["mtime_ns"]))
@@ -176,7 +190,8 @@ class Service:
             self.state.published(job.output, sha)
             output_info = snapshot(job.output)
             detail = {"source_hashes": hashes, "metadata_snapshots": metadata_paths,
-                      "capture_fields": capture, "preview_sha256": sha, "output_info": output_info}
+                      "capture_fields": capture, "preview_sha256": sha, "output_info": output_info,
+                      "quality": quality}
             self.report(job, "success", **detail)
             self.state.put(job.primary, fingerprint, "success", **detail)
             for secondary in job.sources[1:]:
