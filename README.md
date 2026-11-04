@@ -213,6 +213,8 @@ docker compose up -d
 
 镜像内包含应用、公共工具和适配器源码。宿主机 `sdk/` 中的官方压缩包只读挂载到 `/sdk`，由容器在 `/data/sdk` 自动准备运行文件。SDK 压缩包、动态库、模型和授权文件不纳入公开仓库或默认镜像。
 
+MediaSDK 的命令行程序也会链接图形运行库，镜像包含 GTK 3 和 FreeGLUT，无需启动桌面环境。启动出现 `error while loading shared libraries`（例如缺少 `libgtk-3.so.0`）时，先拉取最新镜像并用 `docker compose up -d --force-recreate` 重建容器。此类报错表示运行环境缺少动态库，需检查镜像依赖或库搜索路径；仅在官方包本身不完整时才需重新获取 SDK。
+
 ## 开发与验证
 
 格式约定见 [.editorconfig](.editorconfig)，统一使用 4 空格缩进。Compose 配置统一命名为 `docker-compose.yml`；JSON Lines 审计日志保持一行一条记录。

@@ -215,6 +215,23 @@ def _verify_media(ready, work_root, runner):
                          "check the SDK input, libraries and NVIDIA container runtime")
 
 
+def _runtime_dependency_failure(error):
+    match = re.search(r"error while loading shared libraries:\s*([^\s:]+):\s*"
+                      r"cannot open shared object file", str(error), re.IGNORECASE)
+    if match is None:
+        return None
+    library = match.group(1)
+    if library.lower().startswith(("libcuda.", "libnvidia-", "libnvcuvid.")):
+        kind = "nvidia_driver"
+        recommendation = ("Check NVIDIA Container Toolkit, host GPU drivers, container GPU "
+                          "configuration and driver-library injection into the container.")
+    else:
+        kind = "shared_library"
+        recommendation = ("Update or rebuild the container image with the required runtime "
+                          "dependency, and check the shared-library search paths.")
+    return {"library": library, "dependency_kind": kind, "recommendation": recommendation}
+
+
 def _prepare_component(cfg, audit, runner, base, component):
     destination = base / component
     if destination.exists() or destination.is_symlink():
@@ -267,11 +284,24 @@ def _prepare_component(cfg, audit, runner, base, component):
         except Cancelled:
             raise
         except Exception as error:
+            dependency = _runtime_dependency_failure(error)
+            if dependency is not None:
+                audit.emit("sdk.runtime_dependency.missing", component=component,
+                           error=str(error), **dependency)
+                audit.emit("sdk.prepare.failed", component=component, error=str(error),
+                           classification="runtime_dependency", missing_library=dependency["library"],
+                           previous_runtime_preserved=destination.exists())
+                raise RuntimeError(
+                    f"{component} SDK preparation failed: the container image/runtime environment "
+                    f"is missing shared library {dependency['library']}. "
+                    f"{dependency['recommendation']} Original loader error: {error}") from error
             audit.emit("sdk.prepare.failed", component=component, error=str(error),
+                       classification="preparation",
                        previous_runtime_preserved=destination.exists())
             raise RuntimeError(f"{component} SDK preparation failed: {error}. "
-                               "The official SDK is precompiled; damaged original libraries must be "
-                               "replaced with an intact official SDK input.") from error
+                               "Check SDK inputs, build tools and container runtime dependencies. "
+                               "The official SDK is precompiled; replace its original input only "
+                               "if its files are missing or damaged.") from error
 
 
 def prepare_sdks(cfg, audit, runner, metadata_only=False):

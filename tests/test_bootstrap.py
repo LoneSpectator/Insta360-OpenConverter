@@ -174,6 +174,52 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in (self.data / "sdk").iterdir()),
                          [".insta360-bootstrap.lock", "metadata"])
 
+    def failing_media_library(self, library):
+        files = self.media_files()
+        files["SDK/bin/MediaSDKTest"] = (
+            "#!/bin/sh\n"
+            f"echo 'MediaSDKTest: error while loading shared libraries: {library}: "
+            "cannot open shared object file: No such file or directory' >&2\n"
+            "exit 127\n").encode()
+        self.archive(self.media.name, files)
+
+    def test_missing_loader_library_reports_image_dependency_without_publishing_cache(self):
+        self.failing_media_library("libgtk-3.so.0")
+        with self.assertRaisesRegex(RuntimeError, "container image/runtime environment") as failure:
+            self.prepare()
+        self.assertIn("libgtk-3.so.0", str(failure.exception))
+        self.assertIn("Update or rebuild the container image", str(failure.exception))
+        self.assertIn("exited 127", str(failure.exception))
+        self.assertIn("cannot open shared object file", str(failure.exception))
+        self.assertNotIn("replace its original input", str(failure.exception))
+        self.assertIsInstance(failure.exception.__cause__, RuntimeError)
+        self.assertFalse((self.data / "sdk/media").exists())
+        self.assertEqual(self.runner.compiles, 0)
+        dependency = [fields for event, fields in self.audit.events
+                      if event == "sdk.runtime_dependency.missing"][-1]
+        self.assertEqual(dependency["library"], "libgtk-3.so.0")
+        self.assertEqual(dependency["dependency_kind"], "shared_library")
+        failed = [fields for event, fields in self.audit.events if event == "sdk.prepare.failed"][-1]
+        self.assertEqual(failed["classification"], "runtime_dependency")
+        self.assertFalse(failed["previous_runtime_preserved"])
+
+    def test_missing_nvidia_library_preserves_existing_runtime_and_points_to_driver_injection(self):
+        self.prepare()
+        runtime = self.data / "sdk/media"
+        previous = tree_sha256(runtime)
+        self.failing_media_library("libcuda.so.1")
+        with self.assertRaisesRegex(RuntimeError, "NVIDIA Container Toolkit") as failure:
+            self.prepare()
+        self.assertIn("driver-library injection", str(failure.exception))
+        self.assertNotIn("replace its original input", str(failure.exception))
+        self.assertEqual(tree_sha256(runtime), previous)
+        dependency = [fields for event, fields in self.audit.events
+                      if event == "sdk.runtime_dependency.missing"][-1]
+        self.assertEqual(dependency["dependency_kind"], "nvidia_driver")
+        failed = [fields for event, fields in self.audit.events if event == "sdk.prepare.failed"][-1]
+        self.assertEqual(failed["missing_library"], "libcuda.so.1")
+        self.assertTrue(failed["previous_runtime_preserved"])
+
     def test_metadata_only_needs_no_media_sdk(self):
         self.media.unlink()
         self.prepare(metadata_only=True)

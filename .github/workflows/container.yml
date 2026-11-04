@@ -74,6 +74,9 @@ jobs:
             - name: Test non-root container entry point and media workflow
               run: |
                   docker run --rm --read-only --tmpfs /tmp:size=256m,mode=1777 insta360-openconverter:ci --help
+                  # MediaSDK's OpenCV build links GTK even for its command-line entry point.
+                  docker run --rm --read-only --entrypoint python3 insta360-openconverter:ci \
+                    -c 'import ctypes; [ctypes.CDLL(name) for name in ("libgtk-3.so.0", "libgdk-3.so.0", "libglut.so.3")]'
                   # The SDK double is executable, like the real /data/sdk mount. Docker
                   # makes /tmp tmpfs noexec by default, so fixtures use a separate mount.
                   docker run --rm --read-only --tmpfs /tmp:size=64m,mode=1777 \

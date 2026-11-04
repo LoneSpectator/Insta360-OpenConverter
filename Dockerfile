@@ -11,7 +11,7 @@ RUN --mount=type=secret,id=proxy_ca \
     apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates tzdata python3 python3-tomli ffmpeg libimage-exiftool-perl tini g++ \
       libegl1 libgl1 libvulkan1 libglib2.0-0 libgomp1 libxrender1 libxext6 \
-      libxi6 libxrandr2 libxcursor1 libxinerama1 libsm6 libasound2 \
+      libxi6 libxrandr2 libxcursor1 libxinerama1 libsm6 libasound2 libgtk-3-0 freeglut3 \
     && rm -rf /var/lib/apt/lists/* /tmp/apt-proxy-ca.conf
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 LANG=C.UTF-8 TZ=Asia/Shanghai \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
