@@ -83,8 +83,11 @@ static std::string track(const fs::path& directory, const std::string& name, Get
         out << '\n';
     }
     out.close();
-    return "{\"available\":" + std::string(available ? "true" : "false") +
-           ",\"count\":" + std::to_string(values.size()) + ",\"file\":" + quoted(filename) + '}';
+    return "{\n"
+           "            \"available\": " + std::string(available ? "true" : "false") + ",\n"
+           "            \"count\": " + std::to_string(values.size()) + ",\n"
+           "            \"file\": " + quoted(filename) + "\n"
+           "        }";
 }
 
 int main(int argc, char** argv) {
@@ -112,15 +115,23 @@ int main(int argc, char** argv) {
         const auto timelapse = track<RawTimelapseItem_t>(output, "timelapse", [&](auto& v) { return parser.GetTimelapsePtsData(v); });
         std::ofstream summary(output / "sdk.json");
         summary.exceptions(std::ios::badbit | std::ios::failbit);
-        summary << "{\"reader\":\"insta360-metadata\",\"schema_version\":1,\"sdk\":\"InsMetaDataSDK\","
-                << "\"camera_type\":" << quoted(parser.GetCameraType())
-                << ",\"firmware_version\":" << quoted(parser.GetFireWareVersion())
-                << ",\"serial_number\":" << quoted(parser.GetSerialNumber())
-                << ",\"gyro_first_timestamp_ms\":" << parser.GetFirstTimeStamp()
-                << ",\"timestamp_policy\":\"SDK raw values; gyro origin is not a capture date; "
-                   "SDK 2.0.2 GPS timestampMs name and seconds comment disagree\""
-                << ",\"tracks\":{\"gps\":" << gps << ",\"gyro\":" << gyro
-                << ",\"exposure\":" << exposure << ",\"timelapse\":" << timelapse << "}}\n";
+        summary << "{\n"
+                   "    \"reader\": \"insta360-metadata\",\n"
+                   "    \"schema_version\": 1,\n"
+                   "    \"sdk\": \"InsMetaDataSDK\",\n"
+                << "    \"camera_type\": " << quoted(parser.GetCameraType()) << ",\n"
+                << "    \"firmware_version\": " << quoted(parser.GetFireWareVersion()) << ",\n"
+                << "    \"serial_number\": " << quoted(parser.GetSerialNumber()) << ",\n"
+                << "    \"gyro_first_timestamp_ms\": " << parser.GetFirstTimeStamp() << ",\n"
+                << "    \"timestamp_policy\": \"SDK raw values; gyro origin is not a capture date; "
+                   "SDK 2.0.2 GPS timestampMs name and seconds comment disagree\",\n"
+                   "    \"tracks\": {\n"
+                << "        \"gps\": " << gps << ",\n"
+                << "        \"gyro\": " << gyro << ",\n"
+                << "        \"exposure\": " << exposure << ",\n"
+                << "        \"timelapse\": " << timelapse << "\n"
+                   "    }\n"
+                   "}\n";
         summary.close();
         return 0;
     } catch (const std::exception& error) {

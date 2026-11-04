@@ -65,7 +65,7 @@ def prepare(archive, destination, expected_hash=None, compiler="g++"):
             "archive": archive.name, "archive_sha256": actual,
             "adapter_source_sha256": sha256(source), "reader_sha256": sha256(reader),
             "library_sha256": sha256(library), "schema": schema,
-        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        }, ensure_ascii=False, indent=4) + "\n", encoding="utf-8")
         os.rename(ready, destination)
     print(f"Prepared metadata SDK: {destination}")
     print(f"Archive SHA256: {actual}")

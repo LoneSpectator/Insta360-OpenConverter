@@ -232,7 +232,7 @@ for name in ("gps", "gyro", "exposure", "timelapse"):
     tracks[name] = {{"available": bool(values), "count": len(values), "file": name + ".jsonl"}}
 summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number": "",
            "gyro_first_timestamp_ms": 0, **data, "tracks": tracks}}
-(directory / "sdk.json").write_text(json.dumps(summary))
+(directory / "sdk.json").write_text(json.dumps(summary, indent=4))
 ''', encoding="utf-8")
         self.metadata_sdk.chmod(0o755)
         self.cfg.metadata_reader = str(self.metadata_sdk)
@@ -422,7 +422,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
                    "gyro": [{"timestamp": 123456789, "acceleration": [0.1, 0.2, 0.3], "rotation": [1, 2, 3]}],
                    "exposure": [{"timestamp": 123456789, "shutter_speed_s": 0.004}],
                    "timelapse": [{"timestamp": 123456789}]}
-        self.metadata_payload.write_text(json.dumps(payload))
+        self.metadata_payload.write_text(json.dumps(payload, indent=4))
         self.assertEqual(self.service.scan_once()["success"], 1)
         actual = self.service.media.metadata(Job((source,)).output)
         self.assertEqual(actual["XMP-tiff:Model"], "Insta360 X5")
@@ -451,7 +451,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
     def test_gyro_origin_does_not_create_a_capture_date(self):
         source = self.event / "gyro-origin.insp"
         shutil.copyfile(self.image, source)
-        self.metadata_payload.write_text(json.dumps({"gyro_first_timestamp_ms": 1_700_000_000_000}))
+        self.metadata_payload.write_text(json.dumps({"gyro_first_timestamp_ms": 1_700_000_000_000}, indent=4))
         self.assertEqual(self.service.scan_once()["success"], 1)
         self.assertNotIn("XMP-exif:DateTimeOriginal", self.service.media.metadata(Job((source,)).output))
 

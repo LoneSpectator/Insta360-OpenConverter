@@ -1,9 +1,0 @@
-services:
-  converter:
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["${NVIDIA_GPU_ID:-0}"]
-              capabilities: [gpu]

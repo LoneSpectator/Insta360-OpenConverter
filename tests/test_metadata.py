@@ -39,7 +39,7 @@ class MetadataTests(unittest.TestCase):
         self.save()
 
     def save(self):
-        (self.root / "sdk.json").write_text(json.dumps(self.schema), encoding="utf-8")
+        (self.root / "sdk.json").write_text(json.dumps(self.schema, indent=4), encoding="utf-8")
 
     def test_missing_tracks_are_recorded_separately_from_parse_failure(self):
         actual = self.reader.extract(self.root / "sample.insv", self.root)

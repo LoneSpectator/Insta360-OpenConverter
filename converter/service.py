@@ -100,7 +100,7 @@ class Service:
             "完整原始元数据仍在原片中。\n\n"
         ) + json.dumps({"status": status, "time": datetime.now().astimezone().isoformat(),
                         "run_id": self.audit.run_id, "sources": job.sources, "preview": job.output,
-                        "event": event, **detail}, ensure_ascii=False, indent=2, default=str) + "\n"
+                        "event": event, **detail}, ensure_ascii=False, indent=4, default=str) + "\n"
         for path in job.reports:
             self.audit.emit("file.write_report", path=path, status=status)
             atomic_text(path, text)
@@ -139,7 +139,7 @@ class Service:
             original_metadata.append(metadata)
             target = metadata_dir / f"{fingerprint}-{index}.json"
             self.audit.emit("file.write_metadata_snapshot", source=source, destination=target)
-            atomic_text(target, json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+            atomic_text(target, json.dumps(metadata, ensure_ascii=False, indent=4) + "\n")
             metadata_paths.append(str(target))
         source_probe = self.media.probe(job.primary) if job.output.suffix == ".mp4" else None
         directory = Path(tempfile.mkdtemp(prefix=".insta360-preview-", dir=job.primary.parent))
@@ -241,5 +241,5 @@ class Service:
         self.audit.emit("scan.finish", **counts)
         atomic_text(self.cfg.data_root / "health.json", json.dumps({
             "last_scan": datetime.now().astimezone().isoformat(), "run_id": self.audit.run_id,
-            "status": "degraded" if counts["failed"] else "ok", **counts}, indent=2) + "\n")
+            "status": "degraded" if counts["failed"] else "ok", **counts}, indent=4) + "\n")
         return counts

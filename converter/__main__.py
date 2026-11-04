@@ -53,7 +53,7 @@ def main(argv=None):
                 raise RuntimeError("Source changed during metadata extraction")
             output = cfg.data_root / "metadata" / f"{token}-inspect-{uuid.uuid4().hex}.json"
             audit.emit("file.write_metadata_snapshot", source=source, destination=output)
-            atomic_text(output, json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+            atomic_text(output, json.dumps(metadata, ensure_ascii=False, indent=4) + "\n")
             audit.emit("metadata.inspect.complete", source=source, source_sha256=source_sha,
                        snapshot=output, sdk_directory=metadata["Insta360SDK"]["snapshot_directory"],
                        capture_fields=capture_fields(metadata))

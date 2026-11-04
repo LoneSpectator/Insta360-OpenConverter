@@ -41,8 +41,8 @@ cp .env.example .env
 
 # 在 Linux 宿主机准备 SDK；需要 Python >= 3.10 和 dpkg-deb。
 python3 scripts/prepare_sdk.py \
-  /path/to/MediaSDK-linux64.tar.gz \
-  ./sdk/media
+    /path/to/MediaSDK-linux64.tar.gz \
+    ./sdk/media
 ```
 
 将命令中的归档路径替换为实际下载路径。脚本在临时目录中解包；对 `.deb` 使用 `dpkg-deb --extract` 提取文件，不执行安装脚本。识别到 `bin/MediaSDKTest`、`lib/`、`bin/models/` 后，将完整 SDK 整理到 `sdk/media`，不会覆盖已有目标目录。
@@ -53,20 +53,20 @@ python3 scripts/prepare_sdk.py \
 
 ```bash
 python3 scripts/prepare_metadata_sdk.py \
-  /path/to/InsMetaDataSDK-linux64.tar.gz \
-  ./sdk/metadata
+    /path/to/InsMetaDataSDK-linux64.tar.gz \
+    ./sdk/metadata
 ```
 
 建议使用容器内的编译环境，以匹配运行镜像。完成下方 `.env` 配置后，先构建镜像，再挂载归档所在目录与 SDK 输出目录：
 
 ```bash
-docker compose -f compose.yaml -f compose.gpu.yaml build
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml build
 docker run --rm --user "$(id -u):$(id -g)" \
-  --mount "type=bind,src=$PWD/sdk,dst=/sdk" \
-  --mount "type=bind,src=/path/to/sdk-archives,dst=/archives,readonly" \
-  --entrypoint python3 insta360-openconverter:local \
-  /app/scripts/prepare_metadata_sdk.py \
-  /archives/InsMetaDataSDK-linux64.tar.gz /sdk/metadata
+    --mount "type=bind,src=$PWD/sdk,dst=/sdk" \
+    --mount "type=bind,src=/path/to/sdk-archives,dst=/archives,readonly" \
+    --entrypoint python3 insta360-openconverter:local \
+    /app/scripts/prepare_metadata_sdk.py \
+    /archives/InsMetaDataSDK-linux64.tar.gz /sdk/metadata
 ```
 
 归档路径替换为实际位置；使用 GHCR 镜像时将命令中的本地镜像名替换为对应镜像。准备结果包含 `bin/insta360-metadata`、官方头文件和 `lib/libInsMetaDataSDK.so`，并用 `build.json` 记录归档、适配器源码和二进制的 SHA256。SDK 及编译结果留在本地 `sdk/metadata`，由 Compose 只读挂载，不参与公开镜像构建。
@@ -89,12 +89,12 @@ NVIDIA_GPU_ID=0
 ### 构建和启动
 
 ```bash
-docker compose -f compose.yaml -f compose.gpu.yaml build
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml build
 # 检查依赖、SDK 动态库和命令行接口。
-docker compose -f compose.yaml -f compose.gpu.yaml run --rm converter doctor
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm converter doctor
 # 扫描一遍；首次部署建议使用小规模测试档案。
-docker compose -f compose.yaml -f compose.gpu.yaml run --rm converter once
-docker compose -f compose.yaml -f compose.gpu.yaml up -d --force-recreate
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm converter once
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --force-recreate
 ```
 
 | 命令 | 行为 |
@@ -134,36 +134,36 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
 | `metadata.reader` | `/data/sdk/metadata/bin/insta360-metadata` | 官方元数据 SDK 的本地适配器 |
 | `metadata.library_dirs` | `["/data/sdk/metadata/lib"]` | 元数据 SDK 运行库目录 |
 
-CPU 适配需要支持 CPU 的官方 SDK，并验证其软件编解码、CUDA 开关和 CPU 渲染参数。完成适配后设置 `sdk.mode = "cpu"`、`sdk.cpu_compatible = true`，仅使用 `compose.yaml` 部署。该配置开关不提供 SDK 本身缺失的 CPU 能力。
+CPU 适配需要支持 CPU 的官方 SDK，并验证其软件编解码、CUDA 开关和 CPU 渲染参数。完成适配后设置 `sdk.mode = "cpu"`、`sdk.cpu_compatible = true`，仅使用 `docker-compose.yml` 部署。该配置开关不提供 SDK 本身缺失的 CPU 能力。
 
 ## 目录和处理规则
 
 ```text
 /photo/
-  活动档案/20261102.示例事件/
-    IMG_20261102_123456_00_001.insp          # 原片保留
-    IMG_20261102_123456_00_001_preview.jpg
-    IMG_20261102_123456_00_001.insp_preview.txt
-    VID_20261102_123456_00_002.insv          # 双文件原片
-    VID_20261102_123456_10_002.insv
-    VID_20261102_123456_00_002_preview.mp4   # 一组只生成一份
-    VID_20261102_123456_00_002.insv_preview.txt
-    VID_20261102_123456_10_002.insv_preview.txt
+    活动档案/20261102.示例事件/
+        IMG_20261102_123456_00_001.insp          # 原片保留
+        IMG_20261102_123456_00_001_preview.jpg
+        IMG_20261102_123456_00_001.insp_preview.txt
+        VID_20261102_123456_00_002.insv          # 双文件原片
+        VID_20261102_123456_10_002.insv
+        VID_20261102_123456_00_002_preview.mp4   # 一组只生成一份
+        VID_20261102_123456_00_002.insv_preview.txt
+        VID_20261102_123456_10_002.insv_preview.txt
 /data/
-  config.toml
-  state.sqlite3                           # 持久化处理状态和生成物归属
-  converter.lock
-  health.json                             # 最近完整扫描的结果及时间
-  metadata/<任务指纹>-<输入序号>.json         # SDK 与标准元数据汇总
-  metadata/<任务标识>.sdk-<唯一ID>/
-    sdk.json                              # 官方 SDK 原始字段、轨迹数量及可用状态
-    gps.jsonl                             # GPS 原始轨迹
-    gyro.jsonl                            # 陀螺仪与加速度
-    exposure.jsonl                        # 曝光与快门速度
-    timelapse.jsonl                       # 延时摄影时间戳
-  log/<启动时间带时区>-<PID>.log             # 每次启动新建，JSON Lines
-  sdk/media/                              # 只读挂载的 SDK
-  sdk/metadata/                           # 只读挂载的元数据 SDK 与适配器
+    config.toml
+    state.sqlite3                           # 持久化处理状态和生成物归属
+    converter.lock
+    health.json                             # 最近完整扫描的结果及时间
+    metadata/<任务指纹>-<输入序号>.json         # SDK 与标准元数据汇总
+    metadata/<任务标识>.sdk-<唯一ID>/
+        sdk.json                              # 官方 SDK 原始字段、轨迹数量及可用状态
+        gps.jsonl                             # GPS 原始轨迹
+        gyro.jsonl                            # 陀螺仪与加速度
+        exposure.jsonl                        # 曝光与快门速度
+        timelapse.jsonl                       # 延时摄影时间戳
+    log/<启动时间带时区>-<PID>.log             # 每次启动新建，JSON Lines
+    sdk/media/                              # 只读挂载的 SDK
+    sdk/metadata/                           # 只读挂载的元数据 SDK 与适配器
 ```
 
 - 扫描整个 `photo_root`，包括多层事件目录；`YYYYMMDD.事件名称` 用于说明文件中的事件识别，不限制更深层文件。大小写扩展名和中文/空格路径均支持。不跟随符号链接，也不扫描本工具的临时目录。
@@ -201,14 +201,16 @@ CONVERTER_IMAGE=ghcr.io/lonespectator/insta360-openconverter:latest
 然后部署，无需本机构建：
 
 ```bash
-docker compose -f compose.yaml -f compose.gpu.yaml pull converter
-docker compose -f compose.yaml -f compose.gpu.yaml run --rm --no-build converter doctor
-docker compose -f compose.yaml -f compose.gpu.yaml up -d --no-build
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml pull converter
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm --no-build converter doctor
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --no-build
 ```
 
 镜像内包含应用和公共工具，SDK 从宿主机 `sdk/media` 挂载。SDK 压缩包、动态库、模型和授权文件不纳入公开仓库或默认镜像。
 
 ## 开发与验证
+
+格式约定见 [.editorconfig](.editorconfig)，统一使用 4 空格缩进。Compose 主配置命名为 `docker-compose.yml`，GPU 覆盖配置为 `docker-compose.gpu.yml`；JSON Lines 日志与轨迹保持一行一条记录。
 
 Python >= 3.10（3.10 还需 `tomli`，镜像通过系统包安装），运行时不需要 PyPI 依赖。编译元数据适配器需 C++17 编译器；容器已包含 GCC。在 Linux 安装 `ffmpeg` 和 `libimage-exiftool-perl` 后：
 
