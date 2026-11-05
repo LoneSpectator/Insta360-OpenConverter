@@ -10,6 +10,7 @@ from converter.metadata import TRACKS
 from converter.scan import digest, snapshot
 from converter.sidecar import MetadataSidecars
 from converter.state import State
+from converter.workspace import TEMP_ROOT_NAME
 
 
 class Audit:
@@ -61,6 +62,7 @@ class MetadataSidecarTests(unittest.TestCase):
 
     def assert_no_temporary(self):
         self.assertFalse(list(self.root.glob(".insta360-metadata-*")))
+        self.assertFalse((self.root / TEMP_ROOT_NAME).exists())
 
     def test_all_metadata_and_tracks_merge_into_one_four_space_json(self):
         self.assertEqual(self.save(), self.output)
@@ -78,6 +80,10 @@ class MetadataSidecarTests(unittest.TestCase):
             self.assertNotIn("records", self.metadata["Insta360SDK"]["tracks"][name])
         self.assertEqual(self.source.read_bytes(), b"original camera data")
         self.assertEqual(self.state.hashes(self.output), [digest(self.output)])
+        staged = [fields["destination"] for event, fields in self.audit.events
+                  if event == "file.write_metadata_snapshot"]
+        self.assertTrue(staged)
+        self.assertTrue(all(path.is_relative_to(self.root / TEMP_ROOT_NAME) for path in staged))
         self.assert_no_temporary()
 
     def test_existing_owned_sidecar_can_be_replaced_on_later_extraction(self):

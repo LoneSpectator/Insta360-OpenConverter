@@ -1,14 +1,13 @@
 import json
 from fractions import Fraction
 import os
-from pathlib import Path
 import re
-import tempfile
 
 from .metadata import MetadataSDK
 from .quality import build_plan, validate_output
 from .scan import digest, snapshot
 from .sidecar import MetadataSidecars
+from .workspace import temporary_workspace
 
 
 def pick(metadata, *names):
@@ -67,16 +66,11 @@ class Media:
         if snapshot(path) != before:
             raise RuntimeError("Source changed before metadata extraction")
         source_sha256 = source_sha256 or digest(path, self.audit)
-        with tempfile.TemporaryDirectory(prefix=".insta360-metadata-", dir=path.parent) as directory:
-            temporary = Path(directory)
-            self.audit.emit("file.create_temporary_directory", path=temporary)
-            try:
-                sdk = self.metadata_sdk.extract(path, temporary)
-                standard = self.metadata(path)
-                standard["Insta360SDK"] = sdk
-                target = self.sidecars.save(path, standard, temporary, before, source_sha256)
-            finally:
-                self.audit.emit("file.remove_temporary_directory", path=temporary)
+        with temporary_workspace(path.parent, self.audit, kind="metadata-read") as temporary:
+            sdk = self.metadata_sdk.extract(path, temporary)
+            standard = self.metadata(path)
+            standard["Insta360SDK"] = sdk
+            target = self.sidecars.save(path, standard, temporary, before, source_sha256)
         sdk["snapshot_file"] = str(target)
         for name, track in sdk["tracks"].items():
             track.pop("file", None)
@@ -117,15 +111,18 @@ class Media:
                     raise RuntimeError("This MediaSDK CLI cannot confirm 10-bit export; refusing to reduce bit depth")
                 argv.append("-enable_10bit")
         argv.extend(cfg.extra_args)
-        self.runner.run(argv, cwd=output.parent, env=self.sdk_environment())
+        self.runner.run(argv, cwd=output.parent, env=self.sdk_environment(output.parent))
         # Some official demo releases return 0 even after an SDK error callback.
         if not output.is_file() or output.is_symlink() or output.stat().st_size == 0:
             raise RuntimeError("SDK returned without a nonempty output file; inspect command.output logs")
 
-    def sdk_environment(self):
+    def sdk_environment(self, work_root=None):
         env = os.environ.copy()
         libraries = self.cfg.library_dirs + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
         env["LD_LIBRARY_PATH"] = ":".join(libraries)
+        if work_root is not None:
+            for name in ("TMPDIR", "TMP", "TEMP"):
+                env[name] = str(work_root)
         return env
 
     def validate(self, path, source_probe=None, plan=None):

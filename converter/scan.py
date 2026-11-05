@@ -6,7 +6,8 @@ from pathlib import Path
 import re
 import stat
 
-from .reports import REPORT_NAME
+from .reports import LEGACY_REPORT_NAME, REPORT_NAME
+from .workspace import TEMP_ROOT_NAME, cleanup_stale_workspaces
 
 
 VIDEO = {".insv", ".lrv"}
@@ -60,7 +61,7 @@ class Job:
         return hashlib.sha256(value.encode()).hexdigest(), sources
 
 
-def scan(root: Path, audit):
+def scan(root: Path, audit, report_directories=None):
     from .sidecar import metadata_path
 
     files = []
@@ -71,10 +72,15 @@ def scan(root: Path, audit):
 
     for directory, dirs, names in os.walk(root, followlinks=False, onerror=failed):
         base = Path(directory)
+        if report_directories is not None and (REPORT_NAME in names or LEGACY_REPORT_NAME in names):
+            report_directories.add(base)
         retained = []
         for name in sorted(dirs):
             path = base / name
-            if path.is_symlink() or name.startswith((".insta360-preview-", ".insta360-metadata-")):
+            if name == TEMP_ROOT_NAME:
+                cleanup_stale_workspaces(base, audit)
+                audit.emit("scan.skip_directory", path=path)
+            elif path.is_symlink() or name.startswith((".insta360-preview-", ".insta360-metadata-")):
                 audit.emit("scan.skip_directory", path=path)
             else:
                 retained.append(name)

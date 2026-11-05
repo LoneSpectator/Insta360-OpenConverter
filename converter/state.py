@@ -15,6 +15,9 @@ class State:
                 updated REAL NOT NULL, detail TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS artifacts (
                 path TEXT PRIMARY KEY, hashes TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS config_aliases (
+                old_fingerprint TEXT NOT NULL, new_fingerprint TEXT NOT NULL,
+                PRIMARY KEY (old_fingerprint, new_fingerprint));
         """)
 
     def get(self, key):
@@ -29,6 +32,24 @@ class State:
     def hashes(self, path):
         row = self.db.execute("SELECT hashes FROM artifacts WHERE path=?", (str(path),)).fetchone()
         return json.loads(row[0]) if row else []
+
+    def register_config_alias(self, old, new):
+        """Preserve render compatibility across content-identical SDK rebuilds."""
+        if old == new:
+            return
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO config_aliases VALUES (?,?)", (old, new))
+
+    def config_aliases(self, current):
+        rows = self.db.execute("""
+            WITH RECURSIVE aliases(fingerprint) AS (
+                SELECT old_fingerprint FROM config_aliases WHERE new_fingerprint=?
+                UNION
+                SELECT old_fingerprint FROM config_aliases JOIN aliases
+                    ON new_fingerprint=aliases.fingerprint)
+            SELECT fingerprint FROM aliases WHERE fingerprint != ? ORDER BY fingerprint
+        """, (current, current)).fetchall()
+        return [row[0] for row in rows]
 
     def intend(self, path, sha):
         # Keep the previous hash until rename is complete, so a crash before or

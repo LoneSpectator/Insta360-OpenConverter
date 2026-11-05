@@ -5,11 +5,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import tempfile
 
 from .audit import Cancelled
 from .metadata import TRACKS
 from .scan import snapshot
+from .workspace import temporary_workspace
 
 
 def metadata_path(source):
@@ -165,45 +165,40 @@ class MetadataSidecars:
                 raise ValueError(f"Invalid SDK track descriptor: {name}")
             description["json_pointer"] = f"/Insta360SDK/tracks/{name}/records"
             description["records"] = _Records(directory / (name + ".jsonl"), description)
-        with tempfile.TemporaryDirectory(prefix=".insta360-metadata-", dir=source.parent) as work:
-            temporary = Path(work)
-            self.audit.emit("file.create_temporary_directory", path=temporary)
+        with temporary_workspace(source.parent, self.audit, kind="metadata-json") as temporary:
+            staged = temporary / destination.name
+            self.audit.emit("file.write_metadata_snapshot", source=source, destination=staged)
+            with staged.open("x", encoding="utf-8") as file:
+                self._write(file, document)
+                file.write("\n")
+                file.flush()
+                os.fsync(file.fileno())
+            self._check_stop()
+            if snapshot(source) != before:
+                raise RuntimeError("Source changed during metadata extraction")
+            sha = self._digest(staged)
+            if self._owned(destination, source) != previous:
+                raise RuntimeError("Metadata changed before publication; refusing to overwrite")
+            self._check_stop()
+            if snapshot(source) != before:
+                raise RuntimeError("Source changed during metadata extraction")
+            self._check_layout(source)
+            self.state.intend(destination, sha)
+            if previous is None:
+                self.audit.emit("file.publish_new_metadata", source=staged,
+                                destination=destination, sha256=sha)
+                os.link(staged, destination)
+                staged.unlink()
+            else:
+                self.audit.emit("file.replace_owned_metadata", source=staged,
+                                destination=destination, sha256=sha)
+                os.replace(staged, destination)
+            descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                staged = temporary / destination.name
-                self.audit.emit("file.write_metadata_snapshot", source=source, destination=staged)
-                with staged.open("x", encoding="utf-8") as file:
-                    self._write(file, document)
-                    file.write("\n")
-                    file.flush()
-                    os.fsync(file.fileno())
-                self._check_stop()
-                if snapshot(source) != before:
-                    raise RuntimeError("Source changed during metadata extraction")
-                sha = self._digest(staged)
-                if self._owned(destination, source) != previous:
-                    raise RuntimeError("Metadata changed before publication; refusing to overwrite")
-                self._check_stop()
-                if snapshot(source) != before:
-                    raise RuntimeError("Source changed during metadata extraction")
-                self._check_layout(source)
-                self.state.intend(destination, sha)
-                if previous is None:
-                    self.audit.emit("file.publish_new_metadata", source=staged,
-                                    destination=destination, sha256=sha)
-                    os.link(staged, destination)
-                    staged.unlink()
-                else:
-                    self.audit.emit("file.replace_owned_metadata", source=staged,
-                                    destination=destination, sha256=sha)
-                    os.replace(staged, destination)
-                descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-                self.state.published(destination, sha)
-                self.audit.emit("metadata.sidecar.complete", source=source, destination=destination,
-                                sha256=sha, records={name: tracks[name]["count"] for name in TRACKS})
-                return destination
+                os.fsync(descriptor)
             finally:
-                self.audit.emit("file.remove_temporary_directory", path=temporary)
+                os.close(descriptor)
+            self.state.published(destination, sha)
+            self.audit.emit("metadata.sidecar.complete", source=source, destination=destination,
+                            sha256=sha, records={name: tracks[name]["count"] for name in TRACKS})
+            return destination

@@ -83,6 +83,21 @@ class ScannerTests(Workspace):
         (temp / "partial.insp").write_bytes(b"x")
         self.assertEqual([j.primary for j in scan(self.photo, self.audit)], [original])
 
+    def test_fixed_workspace_contents_are_excluded_and_unmanaged_files_preserved(self):
+        original = self.file("real.insv")
+        root = self.event / ".insta360-openconverter"
+        root.mkdir()
+        unmanaged = root / "unmanaged"
+        unmanaged.mkdir()
+        direct = root / "fake.insv"
+        nested = unmanaged / "fake.insp"
+        direct.write_bytes(b"unmanaged file: keep this")
+        nested.write_bytes(b"unmanaged directory: keep this too")
+
+        self.assertEqual([job.primary for job in scan(self.photo, self.audit)], [original])
+        self.assertEqual(direct.read_bytes(), b"unmanaged file: keep this")
+        self.assertEqual(nested.read_bytes(), b"unmanaged directory: keep this too")
+
     def test_output_collisions_block_all_owners(self):
         self.file("same.insv")
         self.file("same.lrv")
@@ -303,7 +318,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.cfg.metadata_library_dirs = []
         self.runner = Runner(self.audit, threading.Event(), 30)
         self.service = Service(self.cfg, self.audit, self.runner)
-        self.addCleanup(self.service.close)
+        self.addCleanup(lambda: self.service.close())
 
     def source(self, name):
         path = self.event / name
@@ -329,10 +344,10 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(digest(source), original)
         self.assertEqual(output.stat().st_mtime_ns, original_time)
         self.assertEqual(self.service.scan_once()["skipped"], 1)
-        self.assertFalse(list(self.event.glob(".insta360-preview-*")))
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
         self.assertTrue(metadata_path(source).is_file())
         self.assertFalse((self.data / "metadata").exists())
-        report = json.loads(Job((source,)).report.read_text().split("\n\n", 1)[1])
+        report = json.loads(Job((source,)).report.read_text())
         self.assertEqual(report["files"][source.name]["status"], "success")
 
     def test_video_gets_real_spherical_uuid_and_retains_audio(self):
@@ -359,7 +374,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(self.service.scan_once()["deferred"], 1)
         primary = self.source("VID_20261102_00_001.insv")
         self.assertEqual(self.service.scan_once()["success"], 1)
-        report = json.loads(Job((primary,)).report.read_text().split("\n\n", 1)[1])
+        report = json.loads(Job((primary,)).report.read_text())
         for source in (primary, secondary):
             self.assertEqual(report["files"][source.name]["status"], "success")
             self.assertTrue(metadata_path(source).is_file())
@@ -367,7 +382,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(len(list(self.event.glob("*_preview.mp4"))), 1)
         primary.unlink()
         self.assertEqual(self.service.scan_once()["deferred"], 1)
-        report = json.loads(Job((secondary,)).report.read_text().split("\n\n", 1)[1])
+        report = json.loads(Job((secondary,)).report.read_text())
         self.assertEqual(report["files"][secondary.name]["status"], "deferred")
 
     def test_missing_secondary_metadata_is_repaired_without_reencoding_preview(self):
@@ -384,7 +399,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
         self.assertEqual(len(list(self.event.glob("*_preview.mp4"))), 1)
         self.assertTrue(any(event == "job.metadata_repaired" for event, _ in self.audit.events))
-        report = json.loads(Job((primary, secondary)).report.read_text().split("\n\n", 1)[1])
+        report = json.loads(Job((primary, secondary)).report.read_text())
         for source in (primary, secondary):
             self.assertEqual(report["files"][source.name]["status"], "success")
 
@@ -398,15 +413,104 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         counts = self.service.scan_once()
         self.assertEqual((counts["success"], counts["failed"], counts["deferred"]), (2, 1, 1))
         report_path = Job((good,)).report
-        report = json.loads(report_path.read_text().split("\n\n", 1)[1])
+        report = json.loads(report_path.read_text())
+        self.assertEqual(report_path.name, "Insta360_OpenConverter_convert_report.txt")
         self.assertEqual(set(report["files"]), {good.name, bad.name, waiting.name})
         self.assertEqual(report["files"][good.name]["status"], "success")
         self.assertEqual(report["files"][bad.name]["status"], "failed")
         self.assertEqual(report["files"][waiting.name]["status"], "deferred")
+        self.assertTrue(all(entry["present"] for entry in report["files"].values()))
+        self.assertEqual(next(iter(report["files"])), bad.name)
+        self.assertEqual(report["summary"], {
+            "failed": 1, "total": 3, "processing": 0, "pending": 0, "deferred": 1, "success": 1,
+        })
+        failure = report["files"][bad.name]
+        self.assertRegex(failure["error"], "[\u4e00-\u9fff]")
+        self.assertEqual(failure["error_code"], "sdk_no_output")
+        self.assertIn("nonempty output file", failure["error_raw"])
+        self.assertRegex(report["files"][waiting.name]["reason"], "[\u4e00-\u9fff]")
+        self.assertIn("Missing _00_ lens", report["files"][waiting.name]["reason_raw"])
         self.assertEqual(list(self.event.glob("*.txt")), [report_path])
         other_report = Job((other,)).report
         self.assertEqual(list(nested.glob("*.txt")), [other_report])
-        self.assertEqual(set(json.loads(other_report.read_text().split("\n\n", 1)[1])["files"]), {other.name})
+        self.assertEqual(set(json.loads(other_report.read_text())["files"]), {other.name})
+
+    def test_directory_report_shows_processing_and_all_pending_files_during_conversion(self):
+        first = self.source("aaa-good.insp")
+        failing = self.source("zzz-bad.insv")
+        convert = self.service.media.convert
+        conversions = []
+
+        def inspect_progress(job, output, plan=None):
+            temporary_root = self.event / ".insta360-openconverter"
+            self.assertEqual(output.parent.parent, temporary_root)
+            self.assertTrue(temporary_root.is_dir())
+            self.assertTrue(output.parent.is_dir())
+            self.assertFalse(list(self.event.glob(".insta360-preview-*")))
+            self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
+            if not conversions:
+                report = json.loads(job.report.read_text())
+                self.assertEqual(set(report["files"]), {first.name, failing.name})
+                self.assertEqual(report["files"][first.name]["status"], "processing")
+                self.assertEqual(report["files"][failing.name]["status"], "pending")
+                self.assertTrue(all(entry["present"] for entry in report["files"].values()))
+                self.assertEqual(report["summary"], {
+                    "failed": 0, "total": 2, "processing": 1, "pending": 1,
+                    "deferred": 0, "success": 0,
+                })
+            conversions.append(job.primary)
+            return convert(job, output, plan)
+
+        with patch.object(self.service.media, "convert", inspect_progress):
+            counts = self.service.scan_once()
+        self.assertEqual((counts["success"], counts["failed"]), (1, 1))
+        self.assertEqual(conversions, [first, failing])
+        report = json.loads(Job((first,)).report.read_text())
+        self.assertEqual(list(report["files"]), [failing.name, first.name])
+        self.assertEqual(report["summary"], {
+            "failed": 1, "total": 2, "processing": 0, "pending": 0,
+            "deferred": 0, "success": 1,
+        })
+        self.assertRegex(report["files"][failing.name]["error"], "[\u4e00-\u9fff]")
+        self.assertIn("nonempty output file", report["files"][failing.name]["error_raw"])
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
+
+    def test_legacy_directory_report_migrates_history_without_reencoding(self):
+        source = self.source("report-migration.insp")
+        self.assertEqual(self.service.scan_once()["success"], 1)
+        preview = Job((source,)).output
+        previous = (digest(preview), preview.stat().st_mtime_ns)
+        report_path = Job((source,)).report
+        report_path.unlink()
+        legacy = self.event / "insta360-preview-report.txt"
+        legacy.write_text(
+            "Insta360 OpenConverter directory report v1\n旧版目录处理说明\n\n"
+            + json.dumps({"files": {
+                source.name: {"status": "success", "run_id": "legacy-run"},
+                "removed.insv": {"status": "failed", "error": "Historical SDK failure",
+                                 "note": "Keep this historical audit detail"},
+            }}, ensure_ascii=False, indent=4) + "\n",
+            encoding="utf-8",
+        )
+        with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
+            self.assertEqual(self.service.scan_once()["skipped"], 1)
+
+        self.assertFalse(legacy.exists())
+        self.assertEqual(report_path.name, "Insta360_OpenConverter_convert_report.txt")
+        report = json.loads(report_path.read_text())
+        self.assertEqual(report["files"][source.name]["status"], "success")
+        self.assertTrue(report["files"][source.name]["present"])
+        historical = report["files"]["removed.insv"]
+        self.assertEqual(historical["status"], "failed")
+        self.assertFalse(historical["present"])
+        self.assertEqual(historical["note"], "Keep this historical audit detail")
+        self.assertEqual(historical["error_raw"], "Historical SDK failure")
+        self.assertEqual(report["summary"], {
+            "failed": 0, "total": 1, "processing": 0, "pending": 0,
+            "deferred": 0, "success": 1,
+        })
+        self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
+        self.assertEqual(list(self.event.glob("*.txt")), [report_path])
 
     def test_missing_directory_report_restores_all_skipped_successes_without_reencoding(self):
         first = self.source("first.insp")
@@ -416,10 +520,24 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         report_path.unlink()
         with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
             self.assertEqual(self.service.scan_once()["skipped"], 2)
-        report = json.loads(report_path.read_text().split("\n\n", 1)[1])
+        report = json.loads(report_path.read_text())
         self.assertEqual(set(report["files"]), {first.name, second.name})
         self.assertTrue(all(entry["status"] == "success" for entry in report["files"].values()))
         self.assertEqual(list(self.event.glob("*.txt")), [report_path])
+
+    def test_removing_last_original_updates_progress_without_erasing_audit_record(self):
+        source = self.source("removed.insp")
+        self.assertEqual(self.service.scan_once()["success"], 1)
+        report_path = Job((source,)).report
+        source.unlink()
+        with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
+            counts = self.service.scan_once()
+        self.assertEqual(sum(counts.values()), 0)
+        report = json.loads(report_path.read_text())
+        self.assertEqual(report["summary"]["total"], 0)
+        self.assertEqual(report["summary"]["success"], 0)
+        self.assertFalse(report["files"][source.name]["present"])
+        self.assertEqual(report["files"][source.name]["status"], "success")
 
     def test_same_stem_sources_are_blocked_before_metadata_name_collision(self):
         image = self.source("same.insp")
@@ -428,11 +546,12 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual((counts["success"], counts["failed"], counts["deferred"]), (0, 0, 2))
         self.assertEqual(metadata_path(image).name, "same_metadata.json")
         self.assertEqual(metadata_path(video), metadata_path(image))
-        report = json.loads(Job((image,)).report.read_text().split("\n\n", 1)[1])
+        report = json.loads(Job((image,)).report.read_text())
         for source in (image, video):
             self.assertFalse(Job((source,)).output.exists())
             self.assertEqual(report["files"][source.name]["status"], "deferred")
-            self.assertIn("metadata", report["files"][source.name]["reason"].lower())
+            self.assertIn("同名元数据", report["files"][source.name]["reason"])
+            self.assertIn("metadata", report["files"][source.name]["reason_raw"].lower())
         self.assertFalse(metadata_path(image).exists())
         self.assertFalse((self.data / "metadata").exists())
 
@@ -468,10 +587,8 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         with patch.object(self.service.media, "source_metadata", side_effect=RuntimeError("Temporary SDK failure")):
             self.assertEqual(self.service.scan_once()["failed"], 1)
         self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
-        self.cfg.retry_seconds = 1
-        with patch("converter.service.time.time", return_value=time.time() + 5):
-            with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
-                self.assertEqual(self.service.scan_once()["skipped"], 1)
+        with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
+            self.assertEqual(self.service.scan_once()["skipped"], 1)
         self.assertTrue(metadata_path(source).is_file())
         self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
         self.assertEqual(self.service.state.get(source)["status"], "success")
@@ -488,10 +605,11 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
             self.assertEqual(self.service.scan_once()["failed"], 1)
         self.assertEqual(path.read_bytes(), previous)
         self.assertEqual(digest(preview), preview_sha)
-        report = json.loads(Job((source,)).report.read_text().split("\n\n", 1)[1])
+        report = json.loads(Job((source,)).report.read_text())
         self.assertEqual(report["files"][source.name]["status"], "failed")
-        self.assertIn("externally changed metadata", report["files"][source.name]["error"])
-        self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
+        self.assertRegex(report["files"][source.name]["error"], "[\u4e00-\u9fff]")
+        self.assertIn("externally changed metadata", report["files"][source.name]["error_raw"])
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
 
     def test_sdk_false_success_does_not_stop_other_files(self):
         bad = self.source("bad.insv")
@@ -500,8 +618,99 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual((counts["failed"], counts["success"]), (1, 1))
         self.assertFalse(Job((bad,)).output.exists())
         self.assertTrue(Job((good,)).output.exists())
-        self.assertEqual(self.service.scan_once()["failed"], 1)
-        self.assertTrue(any(event == "job.retry_delayed" for event, _ in self.audit.events))
+        counts = self.service.scan_once()
+        self.assertEqual((counts["failed"], counts["success"], counts["skipped"]), (1, 0, 1))
+        commands = [fields["argv"] for event, fields in self.audit.events
+                    if event == "command.start" and fields["argv"][0] == str(self.sdk)]
+        self.assertEqual(sum(str(bad) in argv for argv in commands), 2)
+        self.assertEqual(sum(str(good) in argv for argv in commands), 1)
+        self.assertTrue(any(event == "job.retry" and fields["source"] == bad
+                            for event, fields in self.audit.events))
+        self.assertFalse(any(event == "job.retry_delayed" for event, _ in self.audit.events))
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
+
+    def test_next_batch_processes_new_files_and_skips_completed_previews(self):
+        completed = self.source("existing.insp")
+        self.assertEqual(self.service.scan_once()["success"], 1)
+        preview = Job((completed,)).output
+        previous = (digest(preview), preview.stat().st_mtime_ns)
+        new = self.source("new.insp")
+
+        with patch.object(self.service.media, "convert", wraps=self.service.media.convert) as convert:
+            counts = self.service.scan_once()
+
+        self.assertEqual((counts["success"], counts["skipped"], counts["failed"]), (1, 1, 0))
+        self.assertEqual(convert.call_count, 1)
+        self.assertEqual(convert.call_args.args[0].primary, new)
+        self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
+        self.assertTrue(Job((new,)).output.is_file())
+        report = json.loads(Job((new,)).report.read_text())
+        self.assertEqual(report["summary"]["total"], 2)
+        self.assertEqual(report["summary"]["success"], 2)
+
+    def test_restart_resumes_interrupted_batch_without_reencoding_completed_files(self):
+        completed = self.source("aaa-completed.insp")
+        interrupted = self.source("bbb-interrupted.insv")
+        pending = self.source("ccc-pending.insp")
+        originals = {source: digest(source) for source in (completed, interrupted, pending)}
+        convert = self.service.media.convert
+
+        def interrupt_second_job(job, output, plan=None):
+            if job.primary == interrupted:
+                output.write_bytes(b"partial SDK output")
+                self.runner.stop.set()
+                raise Cancelled("Simulated shutdown during SDK conversion")
+            return convert(job, output, plan)
+
+        with patch.object(self.service.media, "convert", interrupt_second_job):
+            with self.assertRaises(Cancelled):
+                self.service.scan_once()
+
+        preview = Job((completed,)).output
+        previous = (digest(preview), preview.stat().st_mtime_ns)
+        self.assertFalse(Job((interrupted,)).output.exists())
+        self.assertFalse(Job((pending,)).output.exists())
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
+        report = json.loads(Job((completed,)).report.read_text())
+        self.assertEqual(report["files"][completed.name]["status"], "success")
+        self.assertEqual(report["files"][interrupted.name]["status"], "processing")
+        self.assertEqual(report["files"][pending.name]["status"], "pending")
+
+        self.service.close()
+        self.runner = Runner(self.audit, threading.Event(), 30)
+        self.service = Service(self.cfg, self.audit, self.runner)
+        begin_scan = self.service.reports.begin_scan
+        registered = []
+
+        def inspect_resumed_registration(jobs, **kwargs):
+            errors = begin_scan(jobs, **kwargs)
+            report = json.loads(Job((completed,)).report.read_text())
+            self.assertEqual(report["files"][completed.name]["status"], "success")
+            self.assertEqual(report["files"][interrupted.name]["status"], "pending")
+            self.assertEqual(report["files"][pending.name]["status"], "pending")
+            self.assertEqual(report["summary"], {
+                "failed": 0, "total": 3, "processing": 0, "pending": 2,
+                "deferred": 0, "success": 1,
+            })
+            registered.append(report)
+            return errors
+
+        with patch.object(self.service.reports, "begin_scan", inspect_resumed_registration):
+            with patch.object(self.service.media, "convert", wraps=self.service.media.convert) as resumed_convert:
+                counts = self.service.scan_once()
+
+        self.assertEqual(len(registered), 1)
+        self.assertEqual((counts["success"], counts["skipped"], counts["failed"]), (2, 1, 0))
+        self.assertEqual([call.args[0].primary for call in resumed_convert.call_args_list],
+                         [interrupted, pending])
+        self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
+        self.assertEqual({source: digest(source) for source in originals}, originals)
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
+        report = json.loads(Job((completed,)).report.read_text())
+        self.assertEqual(report["summary"], {
+            "failed": 0, "total": 3, "processing": 0, "pending": 0,
+            "deferred": 0, "success": 3,
+        })
 
     def test_unowned_output_and_text_files_are_preserved(self):
         source = self.source("original.insp")
@@ -509,9 +718,17 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         output.write_bytes(b"user data")
         report = Job((source,)).report
         report.write_text("user explanation", encoding="utf-8")
-        self.assertEqual(self.service.scan_once()["failed"], 1)
+        sibling = self.event.with_name("20261103.独立事件")
+        sibling.mkdir()
+        independent = sibling / "independent.insp"
+        shutil.copyfile(self.image, independent)
+        counts = self.service.scan_once()
+        self.assertEqual((counts["failed"], counts["success"]), (1, 1))
         self.assertEqual(output.read_bytes(), b"user data")
         self.assertEqual(report.read_text(), "user explanation")
+        self.assertTrue(Job((independent,)).output.is_file())
+        independent_report = json.loads(Job((independent,)).report.read_text())
+        self.assertEqual(independent_report["files"][independent.name]["status"], "success")
 
     def test_source_change_replaces_owned_preview(self):
         source = self.source("change.insp")
@@ -541,7 +758,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         with patch.object(self.service.media, "convert", mutate):
             self.assertEqual(self.service.scan_once()["failed"], 1)
         self.assertFalse(Job((source,)).output.exists())
-        self.assertFalse(list(self.event.glob(".insta360-preview-*")))
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
 
     def test_source_mutation_during_metadata_extraction_does_not_publish_json(self):
         source = self.source("metadata-mutates.insv")
@@ -557,7 +774,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
             self.assertEqual(self.service.scan_once()["failed"], 1)
         self.assertFalse(metadata_path(source).exists())
         self.assertFalse(Job((source,)).output.exists())
-        self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
 
     def test_recent_files_wait_and_missing_preview_is_rebuilt(self):
         source = self.source("recent.insp")
@@ -655,16 +872,18 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
             self.assertEqual(track["bytes"], len(original_jsonl))
         self.assertNotIn("snapshot_directory", sdk)
         self.assertFalse((self.data / "metadata").exists())
-        self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
 
     def test_metadata_sdk_failure_is_not_replaced_with_an_exiftool_success(self):
         source = self.source("metadata-fail.insv")
         self.assertEqual(self.service.scan_once()["failed"], 1)
         self.assertFalse(Job((source,)).output.exists())
-        self.assertIn("InsMetaDataSDK Parse failed", Job((source,)).report.read_text())
+        failure = json.loads(Job((source,)).report.read_text())["files"][source.name]
+        self.assertRegex(failure["error"], "[\u4e00-\u9fff]")
+        self.assertIn("InsMetaDataSDK Parse failed", failure["error_raw"])
         self.assertFalse(metadata_path(source).exists())
         self.assertFalse((self.data / "metadata").exists())
-        self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
 
     def test_gyro_origin_does_not_create_a_capture_date(self):
         source = self.event / "gyro-origin.insp"
@@ -695,7 +914,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(metadata["OpenConverter"]["source_sha256"], before)
         self.assertEqual(list(self.event.glob("*_metadata.json")), [metadata_file])
         self.assertFalse((data / "metadata").exists())
-        self.assertFalse(list(self.event.glob(".insta360-metadata-*")))
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
         self.assertEqual(digest(source), before)
         self.assertFalse(Job((source,)).output.exists())
 
@@ -710,7 +929,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(image["IFD0:ImageWidth"], 128)
         self.assertEqual(image["ExifIFD:ExifImageWidth"], 128)
         self.assertEqual(image["XMP-GPano:FullPanoHeightPixels"], 64)
-        report = json.loads(Job((video,)).report.read_text().split("\n\n", 1)[1])
+        report = json.loads(Job((video,)).report.read_text())
         quality = report["files"][video.name]["quality"]
         self.assertEqual(quality["target"]["width"], 128)
         self.assertEqual(quality["target"]["height"], 64)

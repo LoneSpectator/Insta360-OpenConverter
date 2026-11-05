@@ -8,7 +8,6 @@ from pathlib import Path
 import re
 import stat
 import sys
-import tempfile
 import time
 
 # These helpers are also usable as standalone tools. Importing them during a
@@ -19,6 +18,7 @@ from scripts.prepare_sdk import prepare_directory as prepare_media
 from scripts.prepare_sdk import temporary_environment, unpack, validate_tree
 
 from .audit import Cancelled
+from .workspace import temporary_workspace
 
 
 PROJECT = "Insta360-OpenConverter"
@@ -247,8 +247,7 @@ def _prepare_component(cfg, audit, runner, base, component):
         return
     audit.emit("sdk.prepare.start", component=component, source=path, destination=destination,
                reason="first_start_or_changed_or_damaged", builder=builder)
-    with tempfile.TemporaryDirectory(prefix=f".insta360-{component}-", dir=base) as directory:
-        temporary = Path(directory)
+    with temporary_workspace(base, audit, kind="sdk-" + component) as temporary:
         ready = temporary / "ready"
         try:
             raw = path

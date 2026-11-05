@@ -1,9 +1,9 @@
 # 所有路径都是容器内路径。只修改 photo_root 还需要相应修改挂载位置。
 photo_root = "/photo"
-scan_interval = 60
+# 扫描周期，单位为分钟；启动时立即扫描，处理中跳过到期批次。
+scan_interval_minutes = 60
 # 文件最后修改至少 120 秒后才处理；转码结束时再次核对源文件。
 settle_seconds = 120
-retry_seconds = 300
 command_timeout = 7200
 # 0/0 保留源对应的全景尺寸；显式正数才调整分辨率。
 width = 0
@@ -28,6 +28,6 @@ exiftool = "exiftool"
 ffprobe = "ffprobe"
 
 [metadata]
-# 使用官方 InsMetaDataSDK 读取源文件；适配器由 prepare_metadata_sdk.py 本地编译。
+# 使用官方 InsMetaDataSDK 读取源文件；容器首次运行时自动编译适配器。
 reader = "/data/sdk/metadata/bin/insta360-metadata"
 library_dirs = ["/data/sdk/metadata/lib"]

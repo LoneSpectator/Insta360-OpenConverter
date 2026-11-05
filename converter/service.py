@@ -1,10 +1,10 @@
 from datetime import datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
-import tempfile
 import time
 import traceback
 
@@ -15,24 +15,18 @@ from .reports import DirectoryReports
 from .scan import digest, scan, snapshot
 from .sidecar import metadata_path
 from .state import State
+from .workspace import temporary_workspace
 
 
-def atomic_text(path: Path, text: str):
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".insta360-preview-",
-                                     encoding="utf-8", delete=False) as file:
-        temporary = Path(file.name)
-        try:
+def atomic_text(path: Path, text: str, audit=None):
+    with temporary_workspace(path.parent, audit, kind="atomic") as directory:
+        temporary = directory / path.name
+        with temporary.open("x", encoding="utf-8") as file:
             file.write(text)
             file.flush()
             os.fsync(file.fileno())
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-    try:
         os.replace(temporary, path)
         fsync_dir(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def fsync_dir(path):
@@ -137,6 +131,7 @@ class Service:
         # Check both destinations before invoking a potentially expensive SDK job.
         previous = self._owned(job.output)
         self.check_reports(job)
+        self.report(job, "processing")
         hashes, metadata_paths, metadata_info, original_metadata = self.extract_metadata(job, sources)
         source_probes = [self.media.probe(path) for path in job.sources]
         plan = build_plan(cfg, source_probes, job.output.suffix == ".mp4")
@@ -144,9 +139,7 @@ class Service:
                         notes=["Stitching requires reprojection and encoding; not lossless remuxing",
                                "JPEG quality and hidden SDK stitching-fusion defaults remain SDK-controlled"])
         source_probe = source_probes[0] if job.output.suffix == ".mp4" else None
-        directory = Path(tempfile.mkdtemp(prefix=".insta360-preview-", dir=job.primary.parent))
-        self.audit.emit("file.create_temporary_directory", path=directory)
-        try:
+        with temporary_workspace(job.primary.parent, self.audit, kind="preview") as directory:
             staged = directory / job.output.name
             self.media.convert(job, staged, plan)
             self.media.validate(staged, source_probe, plan)
@@ -191,17 +184,19 @@ class Service:
             for secondary in job.sources[1:]:
                 self.state.put(secondary, fingerprint, "paired", primary=str(job.primary), output=str(job.output))
             self.audit.emit("job.success", output=job.output, **detail)
-        finally:
-            self.audit.emit("file.remove_temporary_directory", path=directory)
-            shutil.rmtree(directory)
 
     def scan_once(self):
         if not self.cfg.photo_root.is_dir():
             raise ValueError(f"Archive mount is missing: {self.cfg.photo_root}")
         self.audit.emit("scan.start", root=self.cfg.photo_root)
-        jobs = scan(self.cfg.photo_root, self.audit)
+        report_directories = set()
+        jobs = scan(self.cfg.photo_root, self.audit, report_directories)
+        report_errors = self.reports.begin_scan(jobs, directories=report_directories)
         counts = {"success": 0, "failed": 0, "skipped": 0, "deferred": 0}
+        source_directories = {source.parent for job in jobs for source in job.sources}
+        counts["failed"] = len(set(report_errors) - source_directories)
         config_fingerprint = self.cfg.fingerprint()
+        compatible_configs = self.state.config_aliases(config_fingerprint)
         for job in jobs:
             if self.runner.stop.is_set():
                 raise Cancelled("Shutdown requested between jobs")
@@ -210,6 +205,15 @@ class Service:
             try:
                 fingerprint, sources = job.fingerprint(config_fingerprint)
                 old = self.state.get(job.primary)
+                old_matches = old and (old["fingerprint"] == fingerprint or any(
+                    hashlib.sha256(json.dumps([sources, alias], sort_keys=True).encode()).hexdigest()
+                    == old["fingerprint"] for alias in compatible_configs))
+                if old_matches:
+                    detail = json.loads(old["detail"])
+                    completed_detail = detail if old["status"] == "success" else detail.get("preview_detail")
+                for source in job.sources:
+                    if source.parent in report_errors:
+                        raise RuntimeError(report_errors[source.parent])
                 if job.blocked or any(info["size"] == 0 or time.time_ns() - info["mtime_ns"] <
                                       self.cfg.settle_seconds * 1_000_000_000 for info in sources):
                     reason = job.blocked or "Source is empty or still settling after upload"
@@ -221,16 +225,11 @@ class Service:
                         self.report(job, "deferred", reason=reason)
                         self.state.put(job.primary, fingerprint, "deferred", reason=reason)
                     continue
-                if old and old["fingerprint"] == fingerprint:
+                if old_matches:
                     detail = json.loads(old["detail"])
                     if old["status"] == "failed":
                         completed_detail = detail.get("preview_detail")
-                        if time.time() - old["updated"] < self.cfg.retry_seconds:
-                            if not self.reports.has(job, "failed"):
-                                self.report(job, "failed", error=detail.get("error"))
-                            counts["failed"] += 1
-                            self.audit.emit("job.retry_delayed", source=job.primary, last_error=detail.get("error"))
-                            continue
+                        self.audit.emit("job.retry", source=job.primary, last_error=detail.get("error"))
                     elif old["status"] == "success":
                         completed_detail = detail
                     if completed_detail:
@@ -240,6 +239,7 @@ class Service:
                             self.check_reports(job)
                             repaired = not self.metadata_unchanged(job, detail)
                             if repaired:
+                                self.report(job, "processing")
                                 hashes, paths, infos, _ = self.extract_metadata(job, sources)
                                 if [snapshot(source) for source in job.sources] != sources:
                                     raise RuntimeError("Source changed while repairing metadata")
@@ -250,8 +250,11 @@ class Service:
                             # Re-create an accidentally removed explanatory report.
                             if repaired or not self.reports.has(job, "success"):
                                 self.report(job, "success", **detail)
-                            if repaired or old["status"] != "success":
+                            if repaired or old["status"] != "success" or old["fingerprint"] != fingerprint:
                                 self.state.put(job.primary, fingerprint, "success", **detail)
+                            if old["fingerprint"] != fingerprint:
+                                self.audit.emit("job.fingerprint_updated", source=job.primary,
+                                                previous=old["fingerprint"], current=fingerprint)
                             self.audit.emit("job.skip_unchanged", source=job.primary, preview=job.output)
                             counts["skipped"] += 1
                             continue
@@ -274,5 +277,6 @@ class Service:
         self.audit.emit("scan.finish", **counts)
         atomic_text(self.cfg.data_root / "health.json", json.dumps({
             "last_scan": datetime.now().astimezone().isoformat(), "run_id": self.audit.run_id,
-            "status": "degraded" if counts["failed"] else "ok", **counts}, indent=4) + "\n")
+            "status": "degraded" if counts["failed"] or report_errors else "ok", **counts}, indent=4) + "\n",
+                    audit=self.audit)
         return counts

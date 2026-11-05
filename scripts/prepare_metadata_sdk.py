@@ -10,13 +10,13 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
 
 sys.dont_write_bytecode = True
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.prepare_sdk import command, temporary_environment, unpack, validate_tree
+from converter.workspace import temporary_workspace
 
 
 def sha256(path):
@@ -75,8 +75,7 @@ def prepare(archive, destination, expected_hash=None, compiler="g++"):
     if destination.exists() or destination.is_symlink():
         raise ValueError(f"Destination already exists: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".insta360-metadata-sdk-", dir=destination.parent) as directory:
-        temporary = Path(directory)
+    with temporary_workspace(destination.parent, kind="sdk-metadata") as temporary:
         raw = temporary / "archive"
         raw.mkdir()
         unpack(archive, raw)

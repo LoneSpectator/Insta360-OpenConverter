@@ -2,6 +2,7 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 from pathlib import Path
+import re
 
 try:
     import tomllib
@@ -13,9 +14,8 @@ except ImportError:  # Ubuntu 22.04 / Python 3.10
 class Config:
     photo_root: Path = Path("/photo")
     data_root: Path = Path("/data")
-    scan_interval: int = 60
+    scan_interval_minutes: int = 60
     settle_seconds: int = 120
-    retry_seconds: int = 300
     command_timeout: int = 7200
     width: int = 0
     height: int = 0
@@ -38,6 +38,15 @@ class Config:
     @classmethod
     def load(cls, path: Path, data_root: Path):
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        if "scan_interval" in raw:
+            if "scan_interval_minutes" in raw:
+                raise ValueError("Configure scan_interval_minutes only; scan_interval is its legacy alias")
+            # Scan intervals are now expressed in minutes, including the old
+            # key, so an existing default of 60 becomes the hourly schedule.
+            raw["scan_interval_minutes"] = raw.pop("scan_interval")
+        # Failed files are retried by every scan; the former per-file delay
+        # remains accepted in old configuration files but has no effect.
+        raw.pop("retry_seconds", None)
         sdk = raw.pop("sdk", {})
         tools = raw.pop("tools", {})
         metadata = raw.pop("metadata", {})
@@ -58,7 +67,7 @@ class Config:
         return cfg
 
     def validate(self):
-        for key in ("scan_interval", "retry_seconds", "command_timeout"):
+        for key in ("scan_interval_minutes", "command_timeout"):
             value = getattr(self, key)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{key} must be a positive integer")
@@ -113,9 +122,42 @@ class Config:
                 if value.strip().lower() == "cpu":
                     raise ValueError("GPU rendering is required; CPU rendering is not supported")
 
+    def managed_runtime_identity(self):
+        """Return SDK content identities only for the complete managed layout."""
+        base = self.data_root / "sdk"
+        expected = (
+            str(base / "media/bin/MediaSDKTest"), str(base / "media/bin/models"),
+            [str(base / "media/lib"), str(base / "media/bin")],
+            str(base / "metadata/bin/insta360-metadata"), [str(base / "metadata/lib")],
+        )
+        if (self.executable, self.models, self.library_dirs,
+                self.metadata_reader, self.metadata_library_dirs) != expected:
+            return None
+        identities = []
+        for component in ("media", "metadata"):
+            manifest = base / component / ".insta360-bootstrap.json"
+            try:
+                if manifest.is_symlink() or not manifest.is_file() or manifest.stat().st_size > 65536:
+                    return None
+                with manifest.open("rb") as file:
+                    content = file.read(65537)
+                if len(content) > 65536:
+                    return None
+                data = json.loads(content)
+                identity = data.get("runtime_sha256")
+                if (data.get("project") != "Insta360-OpenConverter"
+                        or type(data.get("schema_version")) is not int
+                        or data["schema_version"] != 1 or data.get("component") != component
+                        or not isinstance(identity, str) or re.fullmatch(r"[0-9a-f]{64}", identity) is None):
+                    return None
+                identities.append(identity)
+            except (OSError, ValueError, TypeError, AttributeError):
+                return None
+        return tuple(identities)
+
     def fingerprint(self):
         values = asdict(self)
-        for key in ("scan_interval", "settle_seconds", "retry_seconds", "command_timeout", "data_root"):
+        for key in ("scan_interval_minutes", "settle_seconds", "command_timeout", "data_root"):
             values.pop(key)
         values["pipeline_version"] = 3
         # Replacing the local SDK also invalidates successful jobs.

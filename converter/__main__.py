@@ -10,6 +10,7 @@ from .bootstrap import prepare_sdks
 from .config import Config
 from .media import capture_fields
 from .scan import digest, snapshot
+from .scheduler import watch_scans
 from .service import Service
 
 
@@ -42,7 +43,15 @@ def main(argv=None):
         # Keep the operation lock for SDK preparation and every SDK user.
         # A second command must not replace a runtime used by an active watch.
         service = Service(cfg, audit, runner)
+        previous_fingerprint = cfg.fingerprint()
+        previous_runtime = cfg.managed_runtime_identity()
         prepare_sdks(cfg, audit, runner, metadata_only=args.command == "metadata")
+        current_fingerprint = cfg.fingerprint()
+        if (previous_runtime is not None and previous_runtime == cfg.managed_runtime_identity()
+                and previous_fingerprint != current_fingerprint):
+            service.state.register_config_alias(previous_fingerprint, current_fingerprint)
+            audit.emit("config.fingerprint_compatible", previous=previous_fingerprint,
+                       current=current_fingerprint, reason="SDK runtime content is unchanged")
         if args.command == "metadata":
             source = args.source.absolute()
             before = snapshot(source)
@@ -57,19 +66,17 @@ def main(argv=None):
         service.doctor()
         if args.command == "doctor":
             return 0
-        while not stop.is_set():
+        if args.command == "once":
             try:
                 counts = service.scan_once()
-                if args.command == "once":
-                    return 1 if counts["failed"] or counts["deferred"] else 0
+                return 1 if counts["failed"] or counts["deferred"] else 0
             except Cancelled:
                 raise
             except Exception as error:
                 audit.emit("scan.failed", error=str(error), error_type=type(error).__name__,
                            traceback=traceback.format_exc())
-                if args.command == "once":
-                    return 1
-            stop.wait(cfg.scan_interval)
+                return 1
+        watch_scans(service, stop, audit, cfg.scan_interval_minutes)
         return 0
     except Cancelled as error:
         audit.emit("service.cancelled", reason=str(error))

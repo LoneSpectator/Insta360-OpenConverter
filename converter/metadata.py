@@ -40,7 +40,9 @@ class MetadataSDK:
 
     def extract(self, source: Path, directory: Path):
         self.audit.emit("metadata_sdk.parse", source=source, destination=directory)
-        self.runner.run([self.cfg.metadata_reader, source, directory], env=self.environment(), cwd=directory)
+        env = self.environment()
+        env.update({key: str(directory) for key in ("TMPDIR", "TMP", "TEMP")})
+        self.runner.run([self.cfg.metadata_reader, source, directory], env=env, cwd=directory)
         summary_path = directory / "sdk.json"
         if summary_path.is_symlink() or not summary_path.is_file() or summary_path.stat().st_size > 1024 * 1024:
             raise ValueError("Metadata SDK did not produce a valid summary file")
