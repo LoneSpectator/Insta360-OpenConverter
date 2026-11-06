@@ -1,4 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -10,6 +13,47 @@ from unittest.mock import patch
 
 from converter.workspace import (TEMP_ROOT_NAME, cleanup_stale_workspaces,
                                  temporary_workspace)
+
+
+@contextmanager
+def delayed_open_file_deletion():
+    """Model NFS retaining an unlinked open lock as a hidden .nfs file."""
+    from converter import workspace as module
+    original_open, original_unlink, original_close = os.open, os.unlink, os.close
+    locks, retained = set(), {}
+    observations = {"delayed_unlinks": 0}
+
+    def opened(path, *args, **kwargs):
+        descriptor = original_open(path, *args, **kwargs)
+        if path == ".workspace.lock":
+            locks.add(descriptor)
+        return descriptor
+
+    def unlinked(path, *args, **kwargs):
+        if path == ".workspace.lock":
+            parent = kwargs["dir_fd"]
+            info = os.stat(path, dir_fd=parent)
+            for descriptor in tuple(locks):
+                opened_info = os.fstat(descriptor)
+                if (info.st_dev, info.st_ino) == (opened_info.st_dev, opened_info.st_ino):
+                    duplicate = os.dup(parent)
+                    os.rename(path, ".nfs-simulated", src_dir_fd=parent, dst_dir_fd=parent)
+                    retained[descriptor] = duplicate
+                    observations["delayed_unlinks"] += 1
+                    return
+        return original_unlink(path, *args, **kwargs)
+
+    def closed(descriptor):
+        if descriptor in retained:
+            parent = retained.pop(descriptor)
+            original_unlink(".nfs-simulated", dir_fd=parent)
+            original_close(parent)
+        locks.discard(descriptor)
+        return original_close(descriptor)
+
+    with patch.object(module.os, "open", opened), patch.object(module.os, "unlink", unlinked), \
+            patch.object(module.os, "close", closed):
+        yield observations
 
 
 class Audit:
@@ -190,6 +234,124 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             with temporary_workspace(self.parent, kind="../outside"):
                 self.fail("Invalid kind must be rejected")
+        self.assertFalse(self.root.exists())
+
+    def test_open_file_delete_deferral_does_not_leave_empty_report_directories(self):
+        with delayed_open_file_deletion() as observed:
+            with temporary_workspace(self.parent, self.audit, kind="report") as work:
+                (work / "report.txt").write_text("published data")
+        self.assertEqual(observed["delayed_unlinks"], 0)
+        self.assertFalse(self.root.exists())
+        self.assertFalse(any(event == "workspace.cleanup_failed" for event, _ in self.audit.events))
+
+    def test_stale_cleanup_also_closes_its_lock_before_deletion(self):
+        self.crash_workspace()
+        with delayed_open_file_deletion() as observed:
+            self.assertEqual(cleanup_stale_workspaces(self.parent, self.audit), 1)
+        self.assertEqual(observed["delayed_unlinks"], 0)
+        self.assertFalse(self.root.exists())
+
+    def test_cleanup_failure_preserves_result_and_recoverable_controls(self):
+        from converter import workspace as module
+        original = module.os.rmdir
+        name = None
+
+        def unavailable(path, *args, **kwargs):
+            if path == name:
+                raise OSError(errno.ENOTEMPTY, "Directory not empty", path)
+            return original(path, *args, **kwargs)
+
+        def operation():
+            nonlocal name
+            with temporary_workspace(self.parent, self.audit, kind="report") as work:
+                name = work.name
+                (work / "staged.txt").write_text("temporary")
+                return "operation completed"
+
+        with patch.object(module.os, "rmdir", unavailable):
+            self.assertEqual(operation(), "operation completed")
+        leftover = self.root / name
+        marker = json.loads((leftover / ".workspace.json").read_text())
+        self.assertEqual(marker["phase"], "cleanup")
+        with (leftover / ".workspace.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        warning = next(detail for event, detail in self.audit.events if event == "workspace.cleanup_failed")
+        self.assertEqual(warning["error_code"], "workspace_cleanup_failed")
+        self.assertEqual(warning["level"], "warning")
+        self.assertIn("清理未完成", warning["message"])
+        self.assertIn("Directory not empty", warning["error"])
+        self.assertEqual(cleanup_stale_workspaces(self.parent, self.audit), 1)
+        self.assertFalse(self.root.exists())
+
+    def test_cleanup_failure_does_not_replace_original_sdk_error(self):
+        from converter import workspace as module
+        original = module.os.rmdir
+        name = None
+        expected = RuntimeError("SDK processing failed")
+
+        def unavailable(path, *args, **kwargs):
+            if path == name:
+                raise OSError(errno.ENOTEMPTY, "Directory not empty", path)
+            return original(path, *args, **kwargs)
+
+        with patch.object(module.os, "rmdir", unavailable):
+            with self.assertRaises(RuntimeError) as caught:
+                with temporary_workspace(self.parent, self.audit, kind="preview") as work:
+                    name = work.name
+                    raise expected
+        self.assertIs(caught.exception, expected)
+        self.assertEqual(cleanup_stale_workspaces(self.parent), 1)
+
+    def test_only_cleanup_phase_can_recover_a_missing_lock(self):
+        work = self.crash_workspace()
+        (work / ".workspace.lock").unlink()
+        self.assertEqual(cleanup_stale_workspaces(self.parent), 0)
+        self.assertTrue((work / "partial.mp4").is_file())
+        marker_path = work / ".workspace.json"
+        marker = json.loads(marker_path.read_text())
+        marker["phase"] = "cleanup"
+        marker_path.write_text(json.dumps(marker, indent=4))
+        self.assertEqual(cleanup_stale_workspaces(self.parent), 1)
+        self.assertFalse(self.root.exists())
+
+    def test_empty_legacy_remnants_are_recovered_without_deleting_unknown_data(self):
+        self.root.mkdir()
+        empty = self.root / "report-0123456789abcdef"
+        empty.mkdir()
+        nonempty = self.root / "report-1111111111111111"
+        nonempty.mkdir()
+        (nonempty / "keep.txt").write_text("keep")
+        unknown = self.root / "user-empty-directory"
+        unknown.mkdir()
+        outside = self.parent / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("outside")
+        link = self.root / "report-2222222222222222"
+        link.symlink_to(outside, target_is_directory=True)
+        self.assertEqual(cleanup_stale_workspaces(self.parent, self.audit), 1)
+        self.assertFalse(empty.exists())
+        self.assertEqual((nonempty / "keep.txt").read_text(), "keep")
+        self.assertTrue(unknown.is_dir())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual((outside / "keep.txt").read_text(), "outside")
+
+    def test_cleanup_during_allocation_does_not_remove_the_new_workspace(self):
+        from converter import workspace as module
+        original = module.os.mkdir
+        cleaned_during_allocation = []
+
+        def cleanup_after_mkdir(path, *args, **kwargs):
+            result = original(path, *args, **kwargs)
+            if isinstance(path, str) and path.startswith(".alloc-report-"):
+                cleaned_during_allocation.append(cleanup_stale_workspaces(self.parent))
+            return result
+
+        with patch.object(module.os, "mkdir", cleanup_after_mkdir):
+            with temporary_workspace(self.parent, self.audit, kind="report") as work:
+                self.assertTrue(work.name.startswith("report-"))
+                self.assertTrue(work.is_dir())
+                self.assertFalse(list(self.root.glob(".alloc-*")))
+        self.assertEqual(cleaned_during_allocation, [0])
         self.assertFalse(self.root.exists())
 
 

@@ -4,6 +4,18 @@ from converter.report_errors import explain_error, explain_reason
 
 
 class ReportErrorTests(unittest.TestCase):
+    def test_legacy_workspace_cleanup_error_is_not_described_as_bad_camera_media(self):
+        for raw in ("[Errno 39] Directory not empty: 'report-0123456789abcdef'",
+                    "[Errno 39] Directory not empty: '/photo/event/.insta360-openconverter/metadata-read-0123456789abcdef'"):
+            with self.subTest(raw=raw):
+                result = explain_error(raw)
+                self.assertEqual(result["error_code"], "workspace_cleanup_failed")
+                self.assertIn("临时工作目录", result["error"])
+                self.assertIn("后续清理", result["error"])
+                self.assertEqual(result["error_raw"], raw)
+        unrelated = "[Errno 39] Directory not empty: '/photo/original-event'"
+        self.assertEqual(explain_error(unrelated)["error_code"], "processing_failed")
+
     def test_filesystem_errors_preserve_original_context(self):
         cases = (
             ("[Errno 13] Permission denied: '/photo/事件/file'", "permission_denied", "权限"),

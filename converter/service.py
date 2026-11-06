@@ -270,10 +270,14 @@ class Service:
                 if completed_detail:
                     failure["preview_detail"] = completed_detail
                 self.state.put(job.primary, fingerprint, "failed", **failure)
-                try:
-                    self.report(job, "failed", error=str(error))
-                except Exception as report_error:
-                    self.audit.emit("report.failed", path=job.report, error=str(report_error))
+                if any(source.parent in report_errors for source in job.sources):
+                    self.audit.emit("report.update_skipped", path=job.report,
+                                    reason="Directory report initialization failed", error=str(error))
+                else:
+                    try:
+                        self.report(job, "failed", error=str(error))
+                    except Exception as report_error:
+                        self.audit.emit("report.failed", path=job.report, error=str(report_error))
         self.audit.emit("scan.finish", **counts)
         atomic_text(self.cfg.data_root / "health.json", json.dumps({
             "last_scan": datetime.now().astimezone().isoformat(), "run_id": self.audit.run_id,

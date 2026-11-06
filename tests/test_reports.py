@@ -1,9 +1,11 @@
+import errno
 import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
+from converter import workspace
 from converter.reports import (DirectoryReports, LEGACY_REPORT_HEADER, LEGACY_REPORT_NAME,
                                REPORT_FORMAT, REPORT_NAME, report_paths)
 from converter.scan import Job
@@ -123,6 +125,31 @@ class DirectoryReportTests(unittest.TestCase):
         self.assertIn("SDK returned", data["files"][second.primary.name]["error_raw"])
         self.assertNotEqual(data["files"][third.primary.name]["reason"], data["files"][third.primary.name]["reason_raw"])
         self.assertEqual(data["files"][first.primary.name]["preview_sha256"], "audit-hash")
+
+    def test_published_report_remains_valid_when_first_workspace_cleanup_fails(self):
+        job = self.job("photo.insp")
+        remove_child = workspace._remove_child
+        failures = []
+
+        def fail_first_cleanup(root_fd, name, child_fd):
+            if not failures:
+                failures.append(name)
+                raise OSError(errno.ENOTEMPTY, "Directory not empty")
+            return remove_child(root_fd, name, child_fd)
+
+        with patch("converter.workspace._remove_child", side_effect=fail_first_cleanup):
+            self.assertEqual(self.reports.begin_scan([job]), {})
+            report = json.loads((self.event / REPORT_NAME).read_text())
+            self.assertEqual(report["files"][job.primary.name]["status"], "pending")
+            self.assertEqual(report["summary"]["failed"], 0)
+            self.assertEqual(report["failures"], [])
+            self.reports.write(job, "success", preview_sha256="completed-preview")
+
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(failures[0].startswith("report-"))
+        self.assertEqual(self.data()["files"][job.primary.name]["status"], "success")
+        self.assertTrue(any(event == "workspace.cleanup_failed" for event, _ in self.audit.events))
+        self.assertFalse(any(event == "report.scan_failed" for event, _ in self.audit.events))
 
     def test_begin_scan_does_not_rewrite_unchanged_report(self):
         job = self.job("photo.insp")

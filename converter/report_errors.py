@@ -128,6 +128,10 @@ def explain_error(raw):
 
     if _chinese_message(text):
         return result("reported_error", text)
+    if re.fullmatch(r"\[Errno 39\] Directory not empty: ['\"](?:[^'\"]*/\.insta360-openconverter/)?"
+                    r"(?:report|preview|metadata|metadata-read|metadata-json|atomic|sdk-media|sdk-metadata)-[0-9a-f]{16}['\"]", text):
+        return result("workspace_cleanup_failed",
+                      "临时工作目录未能清空，目录已保留待后续清理。请查看对应运行日志。")
     for pattern, code, message in (
             (r"(?:\[Errno 13\]\s+Permission denied|(?:^|:\s|\n)Permission denied(?:[:\s]|$))",
              "permission_denied", "文件或目录权限不足，请检查运行用户对相关路径的读写、执行权限。"),

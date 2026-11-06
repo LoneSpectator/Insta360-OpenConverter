@@ -1,5 +1,6 @@
 import io
 from contextlib import redirect_stdout
+import errno
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from converter import workspace
 from converter.audit import Cancelled, Runner
 from converter.config import Config
 from converter.scan import Job, digest, scan
@@ -627,6 +629,110 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertTrue(any(event == "job.retry" and fields["source"] == bad
                             for event, fields in self.audit.events))
         self.assertFalse(any(event == "job.retry_delayed" for event, _ in self.audit.events))
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
+
+    def test_report_cleanup_failure_does_not_fail_conversion_or_reencode_next_batch(self):
+        source = self.source("cleanup-recovery.insp")
+        original = digest(source)
+        remove_child = workspace._remove_child
+        failures = []
+
+        def fail_first_cleanup(root_fd, name, child_fd):
+            if not failures:
+                failures.append(name)
+                raise OSError(errno.ENOTEMPTY, "Directory not empty")
+            return remove_child(root_fd, name, child_fd)
+
+        with patch("converter.workspace._remove_child", side_effect=fail_first_cleanup):
+            counts = self.service.scan_once()
+
+        self.assertEqual((counts["success"], counts["failed"]), (1, 0))
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(failures[0].startswith("report-"))
+        preview = Job((source,)).output
+        previous = (digest(preview), preview.stat().st_mtime_ns)
+        report = json.loads(Job((source,)).report.read_text())
+        self.assertEqual(report["files"][source.name]["status"], "success")
+        self.assertEqual(report["summary"]["failed"], 0)
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(self.service.state.get(source)["status"], "success")
+        self.assertTrue(any(event == "workspace.cleanup_failed" for event, _ in self.audit.events))
+        self.assertFalse(any(event in ("report.scan_failed", "job.failed") for event, _ in self.audit.events))
+        with patch.object(self.service.media, "convert", side_effect=AssertionError("Unexpected re-encoding")):
+            self.assertEqual(self.service.scan_once()["skipped"], 1)
+        self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
+        self.assertEqual(digest(source), original)
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
+
+    def test_sdk_failure_remains_the_reported_cause_when_workspace_cleanup_also_fails(self):
+        source = self.source("sdk-failure.insv")
+        original = digest(source)
+        remove_child = workspace._remove_child
+        failures = []
+
+        def fail_preview_cleanup(root_fd, name, child_fd):
+            if name.startswith("preview-") and not failures:
+                failures.append(name)
+                raise OSError(errno.ENOTEMPTY, "Directory not empty")
+            return remove_child(root_fd, name, child_fd)
+
+        with patch("converter.workspace._remove_child", side_effect=fail_preview_cleanup):
+            with patch.object(self.service.media, "convert", side_effect=RuntimeError("SDK original failure")):
+                counts = self.service.scan_once()
+
+        self.assertEqual((counts["failed"], counts["success"]), (1, 0))
+        self.assertEqual(len(failures), 1)
+        report = json.loads(Job((source,)).report.read_text())
+        self.assertEqual(report["summary"]["failed"], 1)
+        self.assertEqual([failure["file"] for failure in report["failures"]], [source.name])
+        self.assertEqual(report["files"][source.name]["error_raw"], "SDK original failure")
+        self.assertEqual(json.loads(self.service.state.get(source)["detail"])["error"], "SDK original failure")
+        self.assertFalse(Job((source,)).output.exists())
+        self.assertEqual(digest(source), original)
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
+
+    def test_report_initialization_failure_is_attempted_once_and_preserves_completed_preview(self):
+        completed = self.source("aaa-completed.insp")
+        self.assertEqual(self.service.scan_once()["success"], 1)
+        preview = Job((completed,)).output
+        previous = (digest(preview), preview.stat().st_mtime_ns)
+        original = digest(completed)
+        existing_detail = json.loads(self.service.state.get(completed)["detail"])
+        pending = self.source("bbb-pending.insp")
+        report_path = Job((completed,)).report
+        report_path.unlink()
+        sibling = self.event.with_name("20261103.独立事件")
+        sibling.mkdir()
+        independent = sibling / "independent.insp"
+        shutil.copyfile(self.image, independent)
+        link = os.link
+        attempts = []
+
+        def fail_report_publication(source, destination, *args, **kwargs):
+            if Path(destination) == report_path:
+                attempts.append(Path(destination))
+                raise OSError(errno.ENOSPC, "Report filesystem full")
+            return link(source, destination, *args, **kwargs)
+
+        with patch("converter.reports.os.link", side_effect=fail_report_publication):
+            with patch.object(self.service.media, "convert", wraps=self.service.media.convert) as convert:
+                counts = self.service.scan_once()
+
+        self.assertEqual((counts["failed"], counts["success"]), (2, 1))
+        self.assertEqual(attempts, [report_path])
+        self.assertEqual([call.args[0].primary for call in convert.call_args_list], [independent])
+        self.assertTrue(Job((independent,)).output.is_file())
+        independent_report = json.loads(Job((independent,)).report.read_text())
+        self.assertEqual(independent_report["files"][independent.name]["status"], "success")
+        self.assertFalse(Job((pending,)).output.exists())
+        self.assertFalse(metadata_path(pending).exists())
+        self.assertEqual((digest(preview), preview.stat().st_mtime_ns), previous)
+        self.assertEqual(digest(completed), original)
+        self.assertIn(previous[0], self.service.state.hashes(preview))
+        failure = json.loads(self.service.state.get(completed)["detail"])
+        self.assertIn("Report filesystem full", failure["error"])
+        self.assertEqual(failure["preview_detail"], existing_detail)
+        self.assertFalse(report_path.exists())
         self.assertFalse((self.event / ".insta360-openconverter").exists())
 
     def test_next_batch_processes_new_files_and_skips_completed_previews(self):
