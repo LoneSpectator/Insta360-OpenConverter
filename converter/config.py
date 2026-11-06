@@ -22,6 +22,7 @@ class Config:
     bitrate: int = 0
     codec: str = "source"
     flowstate: bool = False
+    photo_flowstate: bool = True
     stitch_type: str = "optflow"
     camera_accessory_type: int = 0
     executable: str = "/data/sdk/media/bin/MediaSDKTest"
@@ -83,8 +84,9 @@ class Config:
         if self.codec not in ("source", "h264", "h265") or self.stitch_type not in (
                 "optflow", "dynamicstitch", "aistitch"):
             raise ValueError("Invalid codec or stitch_type")
-        if type(self.flowstate) is not bool:
-            raise ValueError("flowstate must be a boolean")
+        for key in ("flowstate", "photo_flowstate"):
+            if type(getattr(self, key)) is not bool:
+                raise ValueError(f"{key} must be a boolean")
         if type(self.camera_accessory_type) is not int or not 0 <= self.camera_accessory_type <= 20:
             raise ValueError("camera_accessory_type must be an SDK accessory enum value (0..20)")
         if not self.photo_root.is_absolute() or not self.data_root.is_absolute():
@@ -157,7 +159,8 @@ class Config:
 
     def fingerprint(self):
         values = asdict(self)
-        for key in ("scan_interval_minutes", "settle_seconds", "command_timeout", "data_root"):
+        # Photo-only settings are included in each photo job's identity.
+        for key in ("scan_interval_minutes", "settle_seconds", "command_timeout", "data_root", "photo_flowstate"):
             values.pop(key)
         values["pipeline_version"] = 3
         # Replacing the local SDK also invalidates successful jobs.

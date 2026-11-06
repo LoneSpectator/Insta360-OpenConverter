@@ -1,6 +1,5 @@
 from datetime import datetime
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -146,7 +145,8 @@ class Service:
             capture = self.media.preserve_metadata(job.primary, staged, original_metadata[0], plan)
             actual = self.media.validate(staged, source_probe, plan)
             quality = {"target": plan.record(), "sources": [summarize(probe) for probe in source_probes],
-                       "actual": summarize(actual), "flowstate": cfg.flowstate,
+                       "actual": summarize(actual),
+                       "flowstate": cfg.photo_flowstate if job.output.suffix == ".jpg" else cfg.flowstate,
                        "sdk_defaults": "JPEG quality and internal stitching fusion are SDK-controlled",
                        "encoding": "One SDK export; metadata changes do not re-encode pixels"}
             self.audit.emit("quality.verified", path=staged, **quality)
@@ -203,10 +203,10 @@ class Service:
             fingerprint = "unreadable"
             completed_detail = None
             try:
-                fingerprint, sources = job.fingerprint(config_fingerprint)
+                fingerprint, sources = job.fingerprint(config_fingerprint, photo_flowstate=self.cfg.photo_flowstate)
                 old = self.state.get(job.primary)
                 old_matches = old and (old["fingerprint"] == fingerprint or any(
-                    hashlib.sha256(json.dumps([sources, alias], sort_keys=True).encode()).hexdigest()
+                    job.fingerprint(alias, sources=sources, photo_flowstate=self.cfg.photo_flowstate)[0]
                     == old["fingerprint"] for alias in compatible_configs))
                 if old_matches:
                     detail = json.loads(old["detail"])

@@ -55,9 +55,15 @@ class Job:
     def reports(self):
         return tuple(dict.fromkeys(path.parent / REPORT_NAME for path in self.sources))
 
-    def fingerprint(self, config_fingerprint):
-        sources = [snapshot(path) for path in self.sources]
-        value = json.dumps([sources, config_fingerprint], sort_keys=True)
+    def fingerprint(self, config_fingerprint, sources=None, *, photo_flowstate=True):
+        if sources is None:
+            sources = [snapshot(path) for path in self.sources]
+        values = [sources, config_fingerprint]
+        if self.primary.suffix.lower() == ".insp":
+            # Photo exports must be refreshed after changing pose/orientation
+            # handling; video identities retain their established format.
+            values.append({"photo_export_revision": 1, "flowstate": photo_flowstate})
+        value = json.dumps(values, sort_keys=True)
         return hashlib.sha256(value.encode()).hexdigest(), sources
 
 

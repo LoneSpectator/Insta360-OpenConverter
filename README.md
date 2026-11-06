@@ -121,6 +121,8 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
 
 默认优先保留源画质，不统一缩放到固定分辨率或限制为固定码率。已有配置若仍指定 `3840` / `1920`、`20000000`、`h264` 和 `flowstate = true`，需分别改为 `0` / `0`、`0`、`source` 和 `false` 才能采用新默认。
 
+`flowstate` 控制视频，照片使用独立的 `photo_flowstate`，默认值为 `true`。照片的 FlowState 在同一次 SDK 拼接导出中启用，不追加 JPEG 重编码或缩放；其姿态校正效果仍需在目标 GPU 上用对应机型的原片验证。
+
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `photo_root` | `/photo` | 容器内档案根目录，需与挂载位置一致 |
@@ -130,7 +132,8 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
 | `width` / `height` | `0` / `0` | 自动推导源尺寸；也可同时指定偶数尺寸，宽高比须为 2:1 |
 | `bitrate` | `0` | 按源主视频流合计码率确定编码预算；也可指定 bps |
 | `codec` | `source` | 跟随源 H.264 / H.265；可显式选择 `h264` / `h265` |
-| `flowstate` | `false` | 默认不额外启用 FlowState 防抖 |
+| `flowstate` | `false` | 视频 FlowState 防抖开关 |
+| `photo_flowstate` | `true` | 照片 SDK 拼接中的 FlowState 开关，独立于视频设置 |
 | `sdk.source_root` | `/sdk` | 官方 SDK 压缩包所在目录，默认只读挂载宿主机 `sdk/` |
 | `metadata.reader` | `/data/sdk/metadata/bin/insta360-metadata` | 官方元数据 SDK 的本地适配器 |
 | `metadata.library_dirs` | `["/data/sdk/metadata/lib"]` | 元数据 SDK 运行库目录 |
@@ -206,7 +209,9 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
 
 元数据名称均使用不含扩展名的源文件主名。同一原片的元数据采用一种存放形式：单文件为 `<源文件主名>_metadata.json`；需要多个文件时则全部放入 `<源文件主名>_metadata/`，目录外不再另留同名 JSON。当前支持的数据均可合并，因此只生成单个 JSON。若源文件旁已存在对应的 `_metadata` 目录，程序保留该目录并报告冲突，避免两种形式同时出现。
 
-ExifTool 补充 SDK 未公开的标准拍摄时间等字段，复制目标格式支持的 EXIF/XMP/IPTC 或 QuickTime 字段，并写入与回读核对预览的拍摄时间、相机信息、GPS 和全景标记。尺寸、方向与全景几何字段更新为预览实际值。MP4 保留可复制的 QuickTime 日期，拍摄时间同时写到 XMP；文件 mtime 跟随第一原片。
+ExifTool 补充 SDK 未公开的标准拍摄时间等字段，复制目标格式支持的 EXIF/XMP/IPTC 或 QuickTime 字段，并写入与回读核对预览的拍摄时间、相机信息、GPS 和全景标记。尺寸与全景几何字段更新为预览实际值。MP4 保留可复制的 QuickTime 日期，拍摄时间同时写到 XMP；文件 mtime 跟随第一原片。
+
+照片先记录 SDK 导出的 JPG 方向标记，再复制原片拍摄字段。最终 EXIF/XMP 方向保持 SDK 渲染后的显示语义，不复制原片的 `Orientation` 或 IFD1 缩略图；SDK 未提供方向标记时不从原片补出。元数据写入不旋转图像像素、不追加 JPEG 编码。方向标签一致性检查不能替代对实际画面朝向的验收。
 
 InsMetaDataSDK 的 `GetFirstTimeStamp()` 是陀螺仪时间基准，不能作为拍摄日期。SDK 2.0.2 的 GPS `timestampMs` 字段名与头文件的秒单位注释存在歧义，因此轨迹保留原值，不猜测时间单位或转换成 UTC 日期。缺失的拍摄时间会记入日志，不从文件名或目录名推断。
 
@@ -244,6 +249,8 @@ InsMetaDataSDK 的 `GetFirstTimeStamp()` 是陀螺仪时间基准，不能作为
     ```
 
 升级保留 `sdk/` 中的官方包、原片、元数据和 `/data` 中的状态。容器自动检查 SDK 缓存并按需准备；状态与产物校验通过的已完成文件会复用，未完成文件从原片重新处理，缺失元数据会补回并复用已有预览。旧版目录报告按前述规则自动迁移，既有用户文件冲突会受到保护。升级无需手动构建镜像或解包 SDK。
+
+照片方向规则和 `photo_flowstate` 有独立的状态标识：规则或设置改变后，本工具拥有的旧 JPG 预览会从原片重新导出，视频不会因此重新转码。手动修改过的预览继续受到保护；需要重新生成时，先备份再移除对应 JPG，随后扫描会重新处理。
 
 ## GitHub 自动构建和 GHCR
 

@@ -60,6 +60,20 @@ class ReportErrorTests(unittest.TestCase):
         self.assertEqual(result["error_raw"], raw)
         self.assertNotEqual(result["error_code"], "metadata_sdk_parse_failed")
 
+    def test_photo_orientation_errors_have_specific_chinese_diagnostics(self):
+        for raw, code in (
+            ("SDK JPEG orientation metadata conflicts: {'IFD0:Orientation': 3, 'XMP-tiff:Orientation': 1}",
+             "photo_orientation_invalid"),
+            ("SDK JPEG orientation metadata is invalid: IFD0:Orientation=0", "photo_orientation_invalid"),
+            ("JPEG orientation verification failed: missing or invalid IFD0:Orientation",
+             "photo_orientation_verification_failed"),
+        ):
+            with self.subTest(raw=raw):
+                result = explain_error(raw)
+                self.assertEqual(result["error_code"], code)
+                self.assertIn("方向标记", result["error"])
+                self.assertEqual(result["error_raw"], raw)
+
     def test_command_timeout_and_failure_are_actionable_without_guessing_sdk_cause(self):
         raw = "Command exceeded 7200s: /data/sdk/media/bin/MediaSDKTest"
         self.assertEqual(explain_error(raw)["error_code"], "command_timeout")

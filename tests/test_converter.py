@@ -19,6 +19,7 @@ from unittest.mock import patch
 from converter import workspace
 from converter.audit import Cancelled, Runner
 from converter.config import Config
+from converter.quality import build_plan
 from converter.scan import Job, digest, scan
 from converter.service import Service
 from converter.sidecar import metadata_path
@@ -334,6 +335,110 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
                         "-XMP-exif:GPSLatitude=31.25", "-XMP-exif:GPSLongitude=-121.5", str(path)],
                        check=True, stdout=subprocess.DEVNULL)
         return path
+
+    def asymmetric_jpeg(self):
+        path = self.root / "asymmetric-corners.jpg"
+        image = ("color=c=black:s=128x64,"
+                 "drawbox=x=0:y=0:w=32:h=16:color=red:t=fill,"
+                 "drawbox=x=96:y=0:w=32:h=16:color=green:t=fill,"
+                 "drawbox=x=0:y=48:w=32:h=16:color=blue:t=fill,"
+                 "drawbox=x=96:y=48:w=32:h=16:color=yellow:t=fill")
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", image,
+                        "-frames:v", "1", str(path)], check=True)
+        return path
+
+    def jpeg_raster_hash(self, path):
+        result = subprocess.run([
+            "ffmpeg", "-v", "error", "-noautorotate", "-i", str(path),
+            "-map", "0:v:0", "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
+        ], check=True, capture_output=True)
+        self.assertEqual(len(result.stdout), 128 * 64 * 3)
+        return hashlib.sha256(result.stdout).hexdigest()
+
+    def test_photo_metadata_preserves_sdk_orientation_without_changing_pixels(self):
+        asymmetric = self.asymmetric_jpeg()
+        for index, (source_orientation, sdk_orientation) in enumerate(((1, 3), (3, 1), (3, None))):
+            with self.subTest(source=source_orientation, sdk=sdk_orientation):
+                source = self.event / f"orientation-{index}.insp"
+                staged = self.root / f"sdk-output-{index}.jpg"
+                shutil.copyfile(asymmetric, source)
+                shutil.copyfile(asymmetric, staged)
+                subprocess.run([
+                    EXIFTOOL, "-overwrite_original", f"-IFD0:Orientation#={source_orientation}",
+                    f"-XMP-tiff:Orientation#={source_orientation}",
+                    "-XMP-exif:DateTimeOriginal=2024:06:01 12:34:56+08:00",
+                    "-XMP-tiff:Make=Insta360", "-XMP-tiff:Model=X4", str(source),
+                ], check=True, stdout=subprocess.DEVNULL)
+                if sdk_orientation is not None:
+                    subprocess.run([
+                        EXIFTOOL, "-overwrite_original", f"-IFD0:Orientation#={sdk_orientation}", str(staged),
+                    ], check=True, stdout=subprocess.DEVNULL)
+                original = self.service.media.metadata(source)
+                source_hash = digest(source)
+                raster = self.jpeg_raster_hash(staged)
+                plan = build_plan(self.cfg, [self.service.media.probe(source)], is_video=False)
+
+                with patch.object(self.service.media, "convert") as render:
+                    self.service.media.preserve_metadata(source, staged, original, plan)
+                render.assert_not_called()
+
+                actual = self.service.media.metadata(staged)
+                for tag in ("IFD0:Orientation", "XMP-tiff:Orientation"):
+                    if sdk_orientation is None:
+                        self.assertNotIn(tag, actual)
+                    else:
+                        self.assertEqual(actual[tag], sdk_orientation)
+                self.assertEqual(actual["XMP-exif:DateTimeOriginal"], "2024:06:01 12:34:56+08:00")
+                self.assertEqual(actual["XMP-tiff:Model"], "X4")
+                self.assertEqual((actual["IFD0:ImageWidth"], actual["IFD0:ImageHeight"]), (128, 64))
+                self.assertEqual(self.jpeg_raster_hash(staged), raster)
+                self.assertEqual(digest(source), source_hash)
+                events = [fields for event, fields in self.audit.events
+                          if event == "metadata.orientation_preserved" and fields["path"] == staged]
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["original"], {
+                    "IFD0:Orientation": source_orientation, "XMP-tiff:Orientation": source_orientation,
+                })
+                self.assertEqual(events[0]["sdk_output"],
+                                 {} if sdk_orientation is None else {"IFD0:Orientation": sdk_orientation})
+                self.assertEqual(events[0]["preview"], {} if sdk_orientation is None else {
+                    "IFD0:Orientation": sdk_orientation, "XMP-tiff:Orientation": sdk_orientation,
+                })
+                self.assertTrue(events[0]["photo_flowstate"])
+                self.assertFalse(events[0]["pixel_reencoding"])
+
+    def test_photo_metadata_preserves_sdk_thumbnail_instead_of_copying_source_thumbnail(self):
+        asymmetric = self.asymmetric_jpeg()
+        source = self.event / "thumbnail-source.insp"
+        staged = self.root / "thumbnail-sdk-output.jpg"
+        shutil.copyfile(asymmetric, source)
+        shutil.copyfile(asymmetric, staged)
+        subprocess.run([
+            EXIFTOOL, "-overwrite_original", "-IFD0:Orientation#=3",
+            f"-ThumbnailImage<={self.image}", str(source),
+        ], check=True, stdout=subprocess.DEVNULL)
+        subprocess.run([
+            EXIFTOOL, "-overwrite_original", "-IFD0:Orientation#=1",
+            f"-ThumbnailImage<={asymmetric}", str(staged),
+        ], check=True, stdout=subprocess.DEVNULL)
+        source_thumbnail = subprocess.run(
+            [EXIFTOOL, "-b", "-ThumbnailImage", str(source)], check=True, capture_output=True).stdout
+        sdk_thumbnail = subprocess.run(
+            [EXIFTOOL, "-b", "-ThumbnailImage", str(staged)], check=True, capture_output=True).stdout
+        self.assertTrue(source_thumbnail)
+        self.assertTrue(sdk_thumbnail)
+        self.assertNotEqual(source_thumbnail, sdk_thumbnail)
+        raster = self.jpeg_raster_hash(staged)
+        source_hash = digest(source)
+        plan = build_plan(self.cfg, [self.service.media.probe(source)], is_video=False)
+
+        self.service.media.preserve_metadata(source, staged, self.service.media.metadata(source), plan)
+
+        actual_thumbnail = subprocess.run(
+            [EXIFTOOL, "-b", "-ThumbnailImage", str(staged)], check=True, capture_output=True).stdout
+        self.assertEqual(actual_thumbnail, sdk_thumbnail)
+        self.assertEqual(self.jpeg_raster_hash(staged), raster)
+        self.assertEqual(digest(source), source_hash)
 
     def test_metadata_output_is_empty_and_separate_from_workspace_control_files(self):
         source = self.source("metadata-output.insp")
@@ -1068,6 +1173,11 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(image["ExifIFD:ExifImageWidth"], 128)
         self.assertEqual(image["XMP-GPano:FullPanoHeightPixels"], 64)
         report = json.loads(Job((video,)).report.read_text())
+        photo_quality = report["files"][photo.name]["quality"]
+        self.assertTrue(photo_quality["flowstate"])
+        self.assertEqual(photo_quality["target"]["codec"], "jpeg")
+        self.assertEqual((photo_quality["actual"]["streams"][0]["width"],
+                          photo_quality["actual"]["streams"][0]["height"]), (128, 64))
         quality = report["files"][video.name]["quality"]
         self.assertEqual(quality["target"]["width"], 128)
         self.assertEqual(quality["target"]["height"], 64)
@@ -1079,9 +1189,11 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(actual["fps"], "10")
         commands = [fields["argv"] for event, fields in self.audit.events
                     if event == "command.start" and fields["argv"][0] == str(self.sdk)]
-        self.assertTrue(all("-enable_flowstate" not in args for args in commands))
+        photo_command = next(args for args in commands if str(photo) in args)
+        self.assertIn("-enable_flowstate", photo_command)
         source_rate = self.service.media.probe(video)["streams"][0]["bit_rate"]
         video_command = next(args for args in commands if str(video) in args)
+        self.assertNotIn("-enable_flowstate", video_command)
         self.assertEqual(video_command[video_command.index("-bitrate") + 1], source_rate)
 
 

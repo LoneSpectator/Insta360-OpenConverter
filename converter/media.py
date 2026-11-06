@@ -4,6 +4,7 @@ import os
 import re
 
 from .metadata import MetadataSDK
+from .orientation import ORIENTATION_TAGS, normalized_orientation_args, sdk_orientation, verify_orientation
 from .quality import build_plan, validate_output
 from .scan import digest, snapshot
 from .sidecar import MetadataSidecars
@@ -100,7 +101,8 @@ class Media:
                 "-output_size", f"{plan.width}x{plan.height}", "-stitch_type", cfg.stitch_type,
                 "-model_root_dir", cfg.models.rstrip("/") + "/",
                 "-camera_accessory_type", str(cfg.camera_accessory_type)]
-        if cfg.flowstate:
+        flowstate = cfg.photo_flowstate if output.suffix == ".jpg" else cfg.flowstate
+        if flowstate:
             argv.append("-enable_flowstate")
         if output.suffix == ".mp4":
             argv.extend(["-bitrate", str(plan.bitrate)])
@@ -149,16 +151,24 @@ class Media:
 
     def preserve_metadata(self, source, output, original, plan):
         cfg = self.cfg
+        photo = output.suffix == ".jpg"
+        rendered = self.metadata(output) if photo else {}
+        orientation = sdk_orientation(rendered) if photo else None
         argv = [cfg.exiftool, "-overwrite_original", "-TagsFromFile", source, "-XMP:all"]
-        if output.suffix == ".jpg":
-            argv.extend(["-EXIF:all", "-IPTC:all", "-ICC_Profile"])
+        if photo:
+            # Source direction and thumbnails describe the original pixels.
+            # Retain the SDK-rendered image's direction and thumbnail instead.
+            argv.extend(["-EXIF:all", "-IPTC:all", "-ICC_Profile", "--Orientation", "--IFD1:all"])
         else:
             argv.extend(["-QuickTime:CreateDate", "-QuickTime:ModifyDate",
                          "-Keys:CreationDate", "-Keys:GPSCoordinates", "-Keys:Make", "-Keys:Model"])
         self.runner.run([*argv, output])
         fields = capture_fields(original)
-        assignments = [f"-XMP-tiff:ImageWidth={plan.width}", f"-XMP-tiff:ImageHeight={plan.height}",
-                       "-XMP-tiff:Orientation=1"]
+        assignments = [f"-XMP-tiff:ImageWidth={plan.width}", f"-XMP-tiff:ImageHeight={plan.height}"]
+        if photo:
+            assignments.extend(normalized_orientation_args(orientation))
+        else:
+            assignments.append("-XMP-tiff:Orientation=1")
         for key, group in [("DateTimeOriginal", "XMP-exif"), ("Make", "XMP-tiff"),
                            ("Model", "XMP-tiff"), ("GPSLatitude", "XMP-exif"),
                            ("GPSLongitude", "XMP-exif"), ("SerialNumber", "XMP-aux"),
@@ -172,7 +182,7 @@ class Media:
                             message="No readable capture time; not inferred from directory or mtime")
         group = "XMP-GPano" if output.suffix == ".jpg" else "XMP-GSpherical"
         if output.suffix == ".jpg":
-            assignments.extend(["-IFD0:Orientation=1", f"-ExifIFD:ExifImageWidth={plan.width}",
+            assignments.extend([f"-ExifIFD:ExifImageWidth={plan.width}",
                                 f"-ExifIFD:ExifImageHeight={plan.height}",
                                 f"-IFD0:ImageWidth={plan.width}", f"-IFD0:ImageHeight={plan.height}",
                                 f"-XMP-exif:ExifImageWidth={plan.width}", f"-XMP-exif:ExifImageHeight={plan.height}",
@@ -189,6 +199,13 @@ class Media:
                             f"-{group}:CroppedAreaLeftPixels=0", f"-{group}:CroppedAreaTopPixels=0"])
         self.runner.run([cfg.exiftool, "-overwrite_original", *assignments, output])
         actual = self.metadata(output)
+        if photo:
+            verify_orientation(orientation, actual)
+            self.audit.emit("metadata.orientation_preserved", source=source, path=output,
+                            original={tag: original[tag] for tag in ORIENTATION_TAGS if tag in original},
+                            sdk_output={tag: rendered[tag] for tag in ORIENTATION_TAGS if tag in rendered},
+                            preview={tag: actual[tag] for tag in ORIENTATION_TAGS if tag in actual},
+                            photo_flowstate=cfg.photo_flowstate, pixel_reencoding=False)
         if actual.get(f"{group}:ProjectionType") != "equirectangular":
             raise RuntimeError("360° projection metadata was not written")
         boolean = "UsePanoramaViewer" if output.suffix == ".jpg" else "Spherical"

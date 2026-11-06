@@ -126,6 +126,24 @@ class MediaCommandQualityTests(unittest.TestCase):
         self.assertEqual(runner.help_calls, [])
         self.assertTrue(self.output.is_file())
 
+    def test_photo_flowstate_is_independent_of_video_flowstate(self):
+        self.source = self.photo / "photo.insp"
+        self.source.write_bytes(b"original photo")
+        self.job = Job((self.source,))
+        self.output = self.job.output
+        for photo_enabled, video_enabled in ((True, False), (False, True)):
+            with self.subTest(photo_enabled=photo_enabled, video_enabled=video_enabled):
+                self.cfg.photo_flowstate = photo_enabled
+                self.cfg.flowstate = video_enabled
+                self.output.unlink(missing_ok=True)
+                media, runner = self.media(probe())
+                media.convert(self.job, self.output)
+                command, = runner.conversion_commands
+                self.assertEqual("-enable_flowstate" in command, photo_enabled)
+                self.assertEqual(command[command.index("-output_size") + 1], "5760x2880")
+                self.assertEqual(runner.help_calls, [])
+                self.assertTrue(self.output.is_file())
+
     def test_supplied_plan_controls_command_without_reprobing(self):
         plan = build_plan(
             Config(width=3840, height=1920, bitrate=55000000, codec="h265"),

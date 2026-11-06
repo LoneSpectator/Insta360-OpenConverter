@@ -11,7 +11,10 @@ height = 0
 # 0 沿用源视频码率预算，不固定压低码率。
 bitrate = 0
 codec = "source"
+# 视频的 FlowState 默认关闭；照片独立使用下面的设置。
 flowstate = false
+# 在 SDK 的照片拼接中启用 FlowState，不追加 JPEG 重编码。
+photo_flowstate = true
 stitch_type = "optflow"
 camera_accessory_type = 0
 
