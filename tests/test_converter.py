@@ -300,12 +300,16 @@ schema = {{"reader": "insta360-metadata", "schema_version": 1, "sdk": "InsMetaDa
 if sys.argv[1:] == ["--schema"]:
     print(json.dumps(schema))
     sys.exit(0)
-if "metadata-fail" in Path(sys.argv[1]).name:
+source = Path(sys.argv[1])
+directory = Path(sys.argv[2])
+if not source.is_file() or not directory.is_dir() or any(directory.iterdir()):
+    print("Expected a regular input file and an empty output directory", file=sys.stderr)
+    sys.exit(1)
+if "metadata-fail" in source.name:
     print("InsMetaDataSDK Parse failed (simulated)", file=sys.stderr)
     sys.exit(3)
 payload = Path({str(self.metadata_payload)!r})
 data = json.loads(payload.read_text()) if payload.exists() else {{}}
-directory = Path(sys.argv[2])
 tracks = {{}}
 for name in ("gps", "gyro", "exposure", "timelapse"):
     values = data.pop(name, [])
@@ -330,6 +334,34 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
                         "-XMP-exif:GPSLatitude=31.25", "-XMP-exif:GPSLongitude=-121.5", str(path)],
                        check=True, stdout=subprocess.DEVNULL)
         return path
+
+    def test_metadata_output_is_empty_and_separate_from_workspace_control_files(self):
+        source = self.source("metadata-output.insp")
+        original = digest(source)
+        gyro = [{"timestamp": 123, "rotation": [1.25, -2.0, 3.0]}]
+        self.metadata_payload.write_text(json.dumps({"gyro": gyro}, indent=4), encoding="utf-8")
+        extract = self.service.media.metadata_sdk.extract
+        destinations = []
+
+        def inspect_output(path, directory):
+            self.assertEqual(path, source)
+            self.assertEqual(list(directory.iterdir()), [])
+            workspace = directory.parent
+            self.assertEqual(workspace.parent, self.event / ".insta360-openconverter")
+            self.assertTrue(workspace.name.startswith("metadata-read-"))
+            self.assertTrue((workspace / ".workspace.json").is_file())
+            self.assertTrue((workspace / ".workspace.lock").is_file())
+            destinations.append(directory)
+            return extract(path, directory)
+
+        with patch.object(self.service.media.metadata_sdk, "extract", inspect_output):
+            summary = self.service.media.source_metadata(source)
+        self.assertEqual(len(destinations), 1)
+        actual = json.loads(metadata_path(source).read_text(encoding="utf-8"))
+        self.assertEqual(actual["Insta360SDK"]["tracks"]["gyro"]["records"], gyro)
+        self.assertEqual(summary["Insta360SDK"]["tracks"]["gyro"]["count"], 1)
+        self.assertFalse((self.event / ".insta360-openconverter").exists())
+        self.assertEqual(digest(source), original)
 
     def test_photo_metadata_idempotence_and_original_unchanged(self):
         source = self.source("IMG_中文 照片.INSP")

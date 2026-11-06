@@ -67,10 +67,13 @@ class Media:
             raise RuntimeError("Source changed before metadata extraction")
         source_sha256 = source_sha256 or digest(path, self.audit)
         with temporary_workspace(path.parent, self.audit, kind="metadata-read") as temporary:
-            sdk = self.metadata_sdk.extract(path, temporary)
+            sdk_output = temporary / "sdk-output"
+            sdk_output.mkdir()
+            self.audit.emit("file.create_metadata_output_directory", path=sdk_output)
+            sdk = self.metadata_sdk.extract(path, sdk_output)
             standard = self.metadata(path)
             standard["Insta360SDK"] = sdk
-            target = self.sidecars.save(path, standard, temporary, before, source_sha256)
+            target = self.sidecars.save(path, standard, sdk_output, before, source_sha256)
         sdk["snapshot_file"] = str(target)
         for name, track in sdk["tracks"].items():
             track.pop("file", None)

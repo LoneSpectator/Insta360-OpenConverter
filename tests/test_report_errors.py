@@ -51,6 +51,15 @@ class ReportErrorTests(unittest.TestCase):
         self.assertIn("官方元数据 SDK 无法解析", result["error"])
         self.assertEqual(result["error_raw"], raw)
 
+    def test_native_argument_check_is_distinguished_from_media_parse_failure(self):
+        raw = "/data/sdk/metadata/bin/insta360-metadata exited 1: Expected a regular input file and an empty output directory\n"
+        result = explain_error(raw)
+        self.assertEqual(result["error_code"], "metadata_adapter_arguments_invalid")
+        self.assertIn("空输出目录", result["error"])
+        self.assertIn("尚未开始解析", result["error"])
+        self.assertEqual(result["error_raw"], raw)
+        self.assertNotEqual(result["error_code"], "metadata_sdk_parse_failed")
+
     def test_command_timeout_and_failure_are_actionable_without_guessing_sdk_cause(self):
         raw = "Command exceeded 7200s: /data/sdk/media/bin/MediaSDKTest"
         self.assertEqual(explain_error(raw)["error_code"], "command_timeout")

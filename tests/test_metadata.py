@@ -3,11 +3,17 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
+from converter.audit import Runner
 from converter.config import Config
 from converter.media import capture_fields
 from converter.metadata import MetadataSDK, coordinate
+from converter.service import Service
+from converter.sidecar import metadata_path
+from converter.workspace import TEMP_ROOT_NAME
 
 
 class Audit:
@@ -47,6 +53,17 @@ class MetadataTests(unittest.TestCase):
         self.assertFalse(actual["tracks"]["gps"]["available"])
         self.assertEqual(actual["tracks"]["gps"]["count"], 0)
         self.assertEqual(actual["tracks"]["gps"]["bytes"], 0)
+
+    def test_adapter_scratch_and_working_directory_stay_outside_export_directory(self):
+        with patch.object(self.reader.runner, "run", wraps=self.reader.runner.run) as invoke:
+            self.reader.extract(self.root / "sample.insv", self.root)
+        argv = invoke.call_args.args[0]
+        options = invoke.call_args.kwargs
+        self.assertEqual(argv[-1], self.root)
+        self.assertEqual(options["cwd"], self.root.parent)
+        for name in ("TMPDIR", "TMP", "TEMP"):
+            self.assertEqual(options["env"][name], str(self.root.parent))
+            self.assertNotEqual(options["env"][name], str(self.root))
 
     def test_rejects_path_escape_in_track_descriptor(self):
         self.schema["tracks"]["gps"]["file"] = "../outside.jsonl"
@@ -113,6 +130,31 @@ class MetadataTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("INSTA360_METADATA_READER"), "Local official SDK is not supplied to public CI")
 class OfficialSDKTests(unittest.TestCase):
+    def test_python_extraction_reaches_sdk_parse_with_a_separate_empty_output_directory(self):
+        reader = os.environ["INSTA360_METADATA_READER"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            photo, data = root / "photo", root / "data"
+            photo.mkdir()
+            data.mkdir()
+            source = photo / "invalid.insv"
+            original = b"not an Insta360 camera file"
+            source.write_bytes(original)
+            cfg = Config(photo_root=photo, data_root=data, metadata_reader=reader,
+                         metadata_library_dirs=[str(Path(reader).parent.parent / "lib")])
+            audit = Audit()
+            service = Service(cfg, audit, Runner(audit, threading.Event(), 20))
+            try:
+                with self.assertRaisesRegex(RuntimeError, "exited 3:") as failure:
+                    service.media.source_metadata(source)
+                self.assertIn("InsMetaDataSDK Parse failed", str(failure.exception))
+                self.assertNotIn("empty output directory", str(failure.exception))
+                self.assertFalse(metadata_path(source).exists())
+                self.assertFalse((photo / TEMP_ROOT_NAME).exists())
+                self.assertEqual(source.read_bytes(), original)
+            finally:
+                service.close()
+
     def test_real_adapter_loads_sdk_and_rejects_invalid_input(self):
         reader = os.environ["INSTA360_METADATA_READER"]
         result = json.loads(subprocess.check_output([reader, "--schema"], text=True))

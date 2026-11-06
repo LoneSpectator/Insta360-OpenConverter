@@ -154,6 +154,9 @@ def explain_error(raw):
                           f"运行环境缺少 NVIDIA 驱动库 {name}。请检查宿主机驱动、NVIDIA Container Toolkit 和 GPU 分配。")
         return result("runtime_library_missing",
                       f"运行环境缺少动态库 {name}。请更新容器镜像或检查动态库搜索路径。")
+    if re.search(r"(?:^|:\s|\n)Expected a regular input file and an empty output directory(?:\s|$)", text):
+        return result("metadata_adapter_arguments_invalid",
+                      "元数据适配器的输入文件或空输出目录检查未通过，尚未开始解析原片。请核对路径并更新容器。")
     if "InsMetaDataSDK Parse failed" in text:
         return result("metadata_sdk_parse_failed",
                       "官方元数据 SDK 无法解析原文件，请检查文件是否上传完整及该机型、格式是否受 SDK 支持。")
