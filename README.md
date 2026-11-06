@@ -256,6 +256,8 @@ InsMetaDataSDK 的 `GetFirstTimeStamp()` 是陀螺仪时间基准，不能作为
 
 工作流见 [`.github/workflows/container.yml`](.github/workflows/container.yml)。PR 运行测试和构建，不登录/推送；`main` 更新、`v*` 标签和手动触发在测试通过后构建 **linux/amd64** 并发布。测试同时覆盖开发用 Python 3.12 和镜像内 Python 3.10/系统媒体工具；镜像内测试使用非 root 用户和只读根文件系统，成功后才推送。只使用 GitHub 提供的 `GITHUB_TOKEN`，不需要将 SDK 或个人 PAT 放进 Actions secrets。
 
+测试失败时，Actions 的摘要和注解会显示失败测试与错误堆栈。完整日志保存在本次运行的 `public-test-logs` 或 `container-test-logs` 附件中，保留 14 天；公共测试日志同时记录 Python、FFmpeg 和 ExifTool 版本。
+
 镜像地址：`ghcr.io/lonespectator/insta360-openconverter`。`main` 发布 `latest`、`main` 和 `sha-…`；`v0.1.0` 发布 `0.1.0`、`0.1` 和 `sha-…`。生产部署建议固定版本或镜像 digest。仓库需允许 GitHub Actions，包策略需允许工作流写入 GHCR。公开包支持匿名拉取，私有包需要先登录 GHCR。
 
 Compose 默认使用 GHCR 的 `latest` 镜像，也可在 `.env` 中通过 `CONVERTER_IMAGE` 指定版本或镜像 digest：
