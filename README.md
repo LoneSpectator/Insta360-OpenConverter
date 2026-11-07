@@ -1,6 +1,257 @@
 # Insta360 OpenConverter
 
-面向 Linux x86_64 的 Insta360 全景预览转换服务。通过官方 **Insta360 MediaSDK** 递归处理指定目录中的 INSP、INSV 和 LRV，在原目录生成 `_preview.jpg` / `_preview.mp4`、元数据 JSON 和目录处理报告，在 `/data/log` 保存文件操作审计日志，保留原始文件。
+面向 Linux x86_64 的 Insta360 全景预览转换服务。通过官方 **Insta360 MediaSDK** 递归处理指定目录中的 INSP、INSV 和 LRV，在原目录生成 `_preview.jpg` / `_preview.mp4`、元数据 JSON 和目录处理报告，并保留原始文件。
+
+[最简部署](#最简部署) · [升级](#升级) · [完整配置](#完整配置) · [手动命令](#手动命令)
+
+## 最简部署
+
+适用于 **Linux x86_64 + NVIDIA GPU**。宿主机需安装 Git、Docker Engine、Compose v2、NVIDIA 驱动和 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)。从 [Insta360 开发者平台](https://www.insta360.com/sdk/apply) 获取 Linux x86_64 MediaSDK 和 InsMetaDataSDK 官方压缩包。
+
+以下命令均在**宿主机终端（包括 SSH 终端）**执行。所用账号需能运行 Docker，并对档案目录拥有读写、删除权限。
+
+### 1. 获取部署文件
+
+```bash
+git clone https://github.com/LoneSpectator/Insta360-OpenConverter.git
+cd Insta360-OpenConverter
+mkdir -p data sdk
+cp config.example.toml data/config.toml
+cp .env.example .env
+```
+
+`data/config.toml` 保持默认内容即可。后续命令都在这个包含 `docker-compose.yml` 的目录中执行。
+
+### 2. 放入 SDK 压缩包
+
+将两个官方压缩包放入刚创建的 `sdk/` 目录，保留下载时的文件名：
+
+```text
+sdk/
+    MediaSDK*.tar*.gz
+    InsMetaDataSDK*.tar*.gz
+```
+
+容器会自动识别版本、解包 SDK 并编译元数据适配器。宿主机无需安装 Python 或编译器。
+
+### 3. 设置档案路径和运行账号
+
+编辑 `.env`：
+
+```dotenv
+PHOTO_DIR=/srv/photo
+PUID=1000
+PGID=1000
+NVIDIA_GPU_ID=0
+```
+
+将 `PHOTO_DIR` 改为宿主机实际档案目录。`PUID`、`PGID` 填写上述运行账号的 UID、GID，可分别用 `id -u`、`id -g` 查询；该账号也需能写入本地 `data/`、读取 `sdk/`。默认使用 GPU `0`，其他设备的选择方式见[完整配置](#完整配置)。其余设置保持默认。
+
+### 4. 拉取镜像并启动
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+默认使用 GitHub Actions 发布的 `ghcr.io/lonespectator/insta360-openconverter:latest` 镜像。容器自动运行后台扫描服务：准备 SDK 后立即扫描 `/photo`，随后每 **60 分钟**扫描一次。档案中的新文件、失败任务和被删除的预览会在后续扫描中重新检查。
+
+查看运行日志：
+
+```bash
+docker compose logs -f --tail=100
+```
+
+按 `Ctrl+C` 结束日志跟随，后台服务继续运行。预览文件、`*_metadata.json` 和 `Insta360_OpenConverter_convert_report.txt` 保存在原片目录；详细日志位于宿主机 `data/log/`。首次使用可先用少量素材检查画面、声音、拍摄时间和 GPS。
+
+## 升级
+
+在原部署目录执行：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+拉取新镜像后，第二条命令会更新运行中的容器。使用 `latest` 时，可先在 [GitHub Actions](https://github.com/LoneSpectator/Insta360-OpenConverter/actions) 确认目标版本已经发布成功。
+
+升级继续使用现有 `.env`、`data/config.toml`、`data/state.sqlite3` 和 `sdk/`。已完成且校验通过的产物继续复用，失败或未完成的任务会再次处理。**保留并备份 `data/state.sqlite3`**，程序依靠它确认已有产物的归属。使用固定版本或 digest 时，先在 `.env` 中将 `CONVERTER_IMAGE` 改为目标版本。
+
+跨旧版本升级前，请查看[旧配置迁移](#旧配置迁移)中的兼容说明。
+
+<details>
+<summary>可选：备份状态和更新部署文件</summary>
+
+需要备份或同步仓库中的部署文件时，在原部署目录执行：
+
+```bash
+docker compose stop
+backup_dir="data/upgrade-backups/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$backup_dir"
+cp -a .env data/config.toml data/state.sqlite3* "$backup_dir/"
+git pull --ff-only
+docker compose pull
+docker compose up -d
+```
+
+停止服务后备份，可保持 SQLite 状态及附属文件一致。已有配置继续使用，新选项省略时采用默认值；跨旧版本升级的配置迁移见[旧配置迁移](#旧配置迁移)。
+
+</details>
+
+## 完整配置
+
+默认部署完成后，按需调整本节配置。`.env` 控制宿主机挂载、运行账号、GPU 和镜像；`data/config.toml` 控制扫描与转换，挂载为容器内的 `/data/config.toml`。完整 TOML 示例见 [config.example.toml](config.example.toml)。
+
+### 宿主机设置：.env
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PHOTO_DIR` | 必填 | 宿主机档案路径，挂载到容器 `/photo` |
+| `PUID` | `1000` | 容器运行账号 UID，需能读写和删除档案中的生成物，并写入本地 `data/` |
+| `PGID` | `1000` | 容器运行账号 GID |
+| `NVIDIA_GPU_ID` | `0` | 分配给容器的一张 NVIDIA GPU，填写宿主机索引或完整 UUID |
+| `CONVERTER_IMAGE` | `ghcr.io/lonespectator/insta360-openconverter:latest` | 镜像标签或 digest |
+
+在宿主机执行 `nvidia-smi -L` 查看 GPU。`NVIDIA_GPU_ID` 可设为索引（如 `1`）或完整 UUID（如 `GPU-xxxxxxxx-…`）；UUID 不受索引排序变化影响。Compose 通过 `device_ids` 只分配选中的一张 GPU。
+
+### 扫描与转换：data/config.toml
+
+以下为全部 TOML 配置项。表中的 `sdk.*`、`tools.*` 和 `metadata.*` 分别写在 `[sdk]`、`[tools]`、`[metadata]` 段中；所有路径均为**容器内路径**。
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `photo_root` | `"/photo"` | 容器内档案根目录；更改时同步调整 Compose 挂载目标 |
+| `scan_interval_minutes` | `60` | 固定扫描周期，分钟，正整数；启动时立即扫描 |
+| `settle_seconds` | `120` | 原片最后修改后的等待时间，秒，可为 `0` |
+| `command_timeout` | `7200` | 单条外部命令超时，秒，正整数 |
+| `width` / `height` | `0` / `0` | 同时为 `0` 时推导源尺寸；显式设置须均为正偶数且宽高比为 2:1 |
+| `bitrate` | `0` | 视频编码预算，bps；`0` 按源主视频流合计码率确定 |
+| `codec` | `"source"` | 跟随源编码；可选 `source`、`h264`、`h265` |
+| `flowstate` | `false` | 视频 FlowState 防抖开关 |
+| `photo_flowstate` | `true` | 照片 SDK 拼接中的 FlowState 开关，独立于视频设置 |
+| `stitch_type` | `"optflow"` | 拼接方式：`optflow`、`dynamicstitch`、`aistitch`，需 SDK 支持 |
+| `camera_accessory_type` | `0` | 官方 SDK 配件类型枚举，范围 `0..20`，具体含义以 SDK 文档为准 |
+| `sdk.source_root` | `"/sdk"` | 官方 SDK 包所在的容器内目录，默认只读挂载宿主机 `sdk/` |
+| `sdk.executable` | `"/data/sdk/media/bin/MediaSDKTest"` | 准备后的 MediaSDK 命令行程序 |
+| `sdk.models` | `"/data/sdk/media/bin/models"` | MediaSDK 模型目录 |
+| `sdk.library_dirs` | `["/data/sdk/media/lib", "/data/sdk/media/bin"]` | MediaSDK 运行库搜索目录 |
+| `sdk.extra_args` | `[]` | 追加 SDK 参数；禁止覆盖保留的输入、输出、尺寸和帧选择参数，或关闭 GPU 渲染 |
+| `tools.exiftool` | `"exiftool"` | 标准元数据工具的命令名或路径 |
+| `tools.ffprobe` | `"ffprobe"` | 媒体探测工具的命令名或路径 |
+| `metadata.reader` | `"/data/sdk/metadata/bin/insta360-metadata"` | 官方元数据 SDK 的本地适配器 |
+| `metadata.library_dirs` | `["/data/sdk/metadata/lib"]` | 元数据 SDK 运行库搜索目录 |
+
+例如将扫描周期改为 30 分钟，编辑 `data/config.toml` 中已有的对应行：
+
+```toml
+scan_interval_minutes = 30
+```
+
+修改 `.env` 或 `data/config.toml` 后，在部署目录重建容器使配置生效：
+
+```bash
+docker compose up -d --force-recreate
+```
+
+### 画质设置
+
+默认优先保留源画质：`width = 0`、`height = 0`、`bitrate = 0`、`codec = "source"`，不统一缩放到固定尺寸或限制为固定码率。
+
+`flowstate` 控制视频，照片使用独立的 `photo_flowstate`，默认值为 `true`。照片的 FlowState 在同一次 SDK 拼接导出中启用，不追加 JPEG 重编码或缩放；其姿态校正效果仍需在目标 GPU 上用对应机型的原片验证。
+
+自动尺寸识别支持单个 2:1 主图像/视频流，以及双路同尺寸方形视频流；后者输出为单路宽度的两倍、高度不变。其他镜头布局需显式配置 `width` / `height`，无法确定时记录失败。源视频流缺少码率时，每个输入文件最多使用一次容器总码率估算；仍不可用时交由 SDK 使用源码率。相同码率只代表编码预算，不保证相同画质。
+
+转换后核对尺寸、视频编码、帧率、位深、色度采样和源文件中已知的色彩描述；不符合保留要求的产物不会发布。10-bit 视频使用 H.265，须由 SDK 明确提供 `-enable_10bit`，并通过实际输出检查。源探测结果、导出计划和实际输出参数写入目录处理报告中对应文件条目的 `quality` 字段及审计日志。
+
+全景拼接需要重投影和重新编码，MP4/JPG 输出不属于无损封装转换。程序默认不追加滤镜、降噪、增强或第二次 JPEG 编码；JPEG 质量由 SDK 内部控制，公开 CLI 未提供质量参数。SDK 可能仍执行其内部默认处理，例如部分演示版本默认启用且无法通过 CLI 关闭的 StitchFusion。实际画质和各机型兼容性需使用官方 SDK 与原片验证。
+
+### 旧配置迁移
+
+- 旧版 `sdk.mode` 和 `sdk.cpu_compatible` 已移除，需从已有配置中删除。
+- 扫描周期统一使用分钟，推荐 `scan_interval_minutes`。旧键 `scan_interval` 仍可读取，但也按分钟解释，且不能与新键同时存在。
+- 旧 `retry_seconds` 兼容读取时被忽略，可删除；失败任务由下一批扫描重新检查。
+- 已有画质参数保持原值。采用当前默认时，将宽高改为 `0` / `0`、码率改为 `0`、编码改为 `"source"`、视频 `flowstate` 改为 `false`。
+
+照片方向规则和 `photo_flowstate` 有独立的状态标识：规则或设置改变后，本工具拥有的旧 JPG 预览会从原片重新导出，视频不会因此重新转码。手动修改过的预览继续受到保护；需要重新生成时，先备份再移除对应 JPG，随后扫描会重新处理。
+
+## 手动命令
+
+本节用于依赖检查、单次扫描、单独提取元数据或前台调试。正常后台运行使用最简部署中的 `docker compose up -d`，它已自动选择 `watch`。
+
+`doctor`、`once`、`watch`、`metadata` 是**容器内程序的子命令**。下面每组命令都在宿主机 SSH 终端的**部署目录**执行，由 `docker compose run` 启动临时容器。同一个 `data/` 只允许一个实例运行，因此每组示例先停后台服务，手动命令结束后再恢复。一次选择一组即可。
+
+### 检查运行环境：doctor
+
+```bash
+docker compose stop
+docker compose run --rm converter doctor
+docker compose up -d
+```
+
+检查依赖、SDK 加载和命令行接口，成功返回 `0`，出错返回 `1`。首次使用时也会准备 SDK，检查过程不拼接素材。
+
+### 扫描一遍后退出：once
+
+```bash
+docker compose stop
+docker compose run --rm converter once
+docker compose up -d
+```
+
+扫描并处理当前档案后退出。全部完成返回 `0`，存在失败或等待中的文件时返回 `1`。
+
+### 单独提取一个文件的元数据：metadata
+
+```bash
+docker compose stop
+docker compose run --rm converter metadata "/photo/事件目录/VID_001.insv"
+docker compose up -d
+```
+
+将示例路径替换为实际**容器内路径**：例如 `PHOTO_DIR=/srv/photo` 时，宿主机 `/srv/photo/事件目录/VID_001.insv` 对应容器 `/photo/事件目录/VID_001.insv`。
+
+只准备并调用官方 InsMetaDataSDK，提取元数据和传感器轨迹，结果保存在源文件旁的 `VID_001_metadata.json`。不生成预览。完成日志中的 `snapshot` 指向该文件；解析失败时返回错误。
+
+### 前台持续扫描：watch
+
+```bash
+docker compose stop
+docker compose run --rm converter watch
+# 持续运行；按 Ctrl+C 停止前台任务后，再执行下一行。
+docker compose up -d
+```
+
+扫描规则与后台服务相同。单文件失败会记录到报告，不影响其他文件处理。
+
+## SDK 准备与运行机制
+
+首次启动自动解包 MediaSDK 的程序、运行库和模型，并使用官方 InsMetaDataSDK 头文件及预编译动态库，编译本项目输出 JSON 的 C++ 元数据适配器。镜像包含所需 Python、`dpkg-deb` 和 GCC。
+
+程序按官方文件名前缀识别 SDK 类型，兼容 `.tar.gz` 和 `.tar_时间戳.gz`，不依赖固定版本号或时间戳。同类存在多个版本时，选择可解析的最高语义版本；最高版本存在多个候选包，或版本无法明确判断时，报告冲突并提示整理归档。Compose 将宿主机 `sdk/` 只读挂载到 `/sdk`。
+
+每次启动校验 SDK 归档、构建源码和缓存文件的 SHA256；归档更新或本工具管理的缓存缺失、损坏时自动重建。缓存和准备状态在 `/data/sdk`，解包、编译等临时内容在 `/data/sdk/.insta360-openconverter/`。官方压缩包本身损坏时，替换为完整官方包后重新启动。
+
+四种程序命令都会先完成所需 SDK 的准备与校验，其中 `metadata` 仅准备元数据 SDK。依赖或配置无效时启动失败。
+
+MediaSDK 的命令行程序也会链接图形运行库，镜像包含 GTK 3 和 FreeGLUT，无需启动桌面环境。启动出现 `error while loading shared libraries`（例如缺少 `libgtk-3.so.0`）时，先拉取最新镜像并用 `docker compose up -d --force-recreate` 重建容器。此类报错表示运行环境缺少动态库，需检查镜像依赖或库搜索路径；仅在官方包本身不完整时才需重新获取 SDK。
+
+后台 `watch` 按固定周期触发扫描；上一批仍在处理时跳过到期批次，批次之间不会并行。当前批次完成后等待下一个未来计划点，不补跑错过的批次。每批重新检查失败任务。
+
+重启后依据持久化状态按文件恢复：成功且未变的产物跳过，未完成文件从原片重新处理，原片始终保留。中断时的 `processing` 记录在恢复扫描时回到待处理状态；SDK 未提供视频帧级续转能力。收到 `SIGTERM/SIGINT` 时会终止当前 SDK 子进程组并尝试清理临时文件，不发布半成品。
+
+## 运行要求与兼容性
+
+| 项目 | 要求或状态 |
+| --- | --- |
+| 平台 | Linux x86_64；容器基于 Ubuntu 22.04，镜像架构为 `linux/amd64` |
+| 部署工具 | Git、Docker Engine、Compose v2、NVIDIA Container Toolkit |
+| SDK | 官方 Linux x86_64 MediaSDK（拼接）和 InsMetaDataSDK（元数据读取）压缩包，放在宿主机 `sdk/` |
+| GPU | NVIDIA GPU；驱动需兼容 SDK 包内 CUDA 运行时，具体版本以 SDK 文档为准 |
+| 文件系统 | 档案目录可读写，支持硬链接和原子重命名；`data/` 可读写并允许执行 SDK 缓存，`sdk/` 归档可读 |
+
+官方 [Desktop 指南](https://github.com/Insta360Develop/Insta360-Developer_Docs/blob/main/docs/ch/sdk/x-ace-go/desktop/guide.md) 要求 **MediaSDK 3.x 使用独立 GPU**，本项目统一使用 NVIDIA GPU 部署。InsMetaDataSDK 元数据读取本身不调用 MediaSDK，容器仍使用同一 GPU 配置。离线文件处理不依赖 CameraSDK。
+
+**验证状态**：自动化测试覆盖扫描、文件保护、SDK 字段映射、轨迹保存和 JPG/MP4 元数据回读。官方 InsMetaDataSDK 2.0.2 用于本项目适配器编译、动态库加载和错误路径验证；公开 CI 的 SDK 调用使用测试替身。真实相机数据和 MediaSDK 拼接、机型/LRV 兼容性仍需原片验证。
 
 ## 功能
 
@@ -13,136 +264,6 @@
 - 每个源文件所在目录共用一份 `Insta360_OpenConverter_convert_report.txt`，优先列出失败文件及中文错误说明，在 `/data/log` 保存每次运行的详细审计日志。
 - 通过 Docker Compose 部署，支持指定 NVIDIA GPU 索引或 UUID。
 - 启动时自动准备本地官方 SDK，校验缓存并在需要时重建。
-
-## 运行要求与兼容性
-
-| 项目 | 要求或状态 |
-| --- | --- |
-| 平台 | Linux x86_64；容器基于 Ubuntu 22.04，镜像架构为 `linux/amd64` |
-| 容器环境 | Docker Engine、Compose v2、NVIDIA Container Toolkit |
-| SDK | 官方 Linux x86_64 MediaSDK（拼接）和 InsMetaDataSDK（元数据读取）压缩包，放在宿主机 `sdk/` |
-| GPU | NVIDIA GPU；驱动需兼容 SDK 包内 CUDA 运行时，具体版本以 SDK 文档为准 |
-| 文件系统 | 档案目录可读写，支持硬链接和原子重命名；`data/` 可读写并允许执行 SDK 缓存，`sdk/` 归档可读 |
-
-官方 [Desktop 指南](https://github.com/Insta360Develop/Insta360-Developer_Docs/blob/main/docs/ch/sdk/x-ace-go/desktop/guide.md) 要求 **MediaSDK 3.x 使用独立 GPU**，本项目统一使用 NVIDIA GPU 部署。InsMetaDataSDK 元数据读取本身不调用 MediaSDK，容器仍使用同一 GPU 配置。离线文件处理不依赖 CameraSDK。
-
-**验证状态**：自动化测试覆盖扫描、文件保护、SDK 字段映射、轨迹保存和 JPG/MP4 元数据回读。官方 InsMetaDataSDK 2.0.2 用于本项目适配器编译、动态库加载和错误路径验证；公开 CI 的 SDK 调用使用测试替身。真实相机数据和 MediaSDK 拼接、机型/LRV 兼容性仍需原片验证。
-
-## 部署
-
-从 [Insta360 开发者平台](https://www.insta360.com/sdk/apply) 获取 Linux x86_64 MediaSDK 和 InsMetaDataSDK。NVIDIA GPU 驱动安装在宿主机，通过 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) 提供给容器。部署时宿主机无需安装 Python 或 GCC。
-
-### 1. 初始化配置
-
-在本仓库根目录执行：
-
-```bash
-mkdir -p data sdk
-cp config.example.toml data/config.toml
-cp .env.example .env
-```
-
-### 2. 放置官方 SDK 压缩包
-
-将 MediaSDK 和 InsMetaDataSDK 官方压缩包放到仓库根目录的 `sdk/` 中，保留下载时的原始文件名即可。以下是文件名匹配示例，兼容 `.tar.gz` 和 `.tar_时间戳.gz`：
-
-```text
-sdk/
-    MediaSDK*.tar*.gz
-    InsMetaDataSDK*.tar*.gz
-```
-
-程序从官方文件名前缀识别 SDK 类型，并在准备时检查包内容，不依赖固定版本号或下载时间戳。同类存在多个版本时，选择可解析的最高语义版本；最高版本有多个候选包，或无法明确判断版本时，报告冲突并提示整理归档。
-
-Compose 将 `./sdk` 只读挂载到容器 `/sdk`。解包、目录整理和本项目元数据适配器的编译均由容器自动完成，结果保存在 `/data/sdk`。
-
-### 3. 配置档案目录和 GPU
-
-编辑第 1 步创建的 `.env`：
-
-```dotenv
-PHOTO_DIR=/srv/photo
-PUID=1000
-PGID=1000
-NVIDIA_GPU_ID=0
-```
-
-`PHOTO_DIR` 是宿主机档案目录，挂载到容器 `/photo`。`PUID/PGID` 对应运行用户，可通过 `id -u` / `id -g` 查询。该用户需能读写档案目录与本地 `data/`，并读取 `sdk/` 中的官方压缩包。
-
-通过 `nvidia-smi -L` 查看设备，在 `.env` 中将 `NVIDIA_GPU_ID` 设置为索引（如 `1`）或完整 UUID（如 `GPU-xxxxxxxx-…`）。推荐使用不受索引排序影响的 UUID。Compose 通过 `device_ids` 只分配选中的一张 GPU。
-
-### 4. 拉取镜像和启动
-
-默认使用 GitHub Actions 自动构建并发布的 `ghcr.io/lonespectator/insta360-openconverter:latest` 镜像。所有部署命令使用仓库中的 `docker-compose.yml`：
-
-```bash
-docker compose pull
-docker compose up -d --force-recreate
-```
-
-首次启动会自动解包 MediaSDK 的程序、运行库和模型，并使用官方 InsMetaDataSDK 头文件及预编译动态库，编译本项目输出 JSON 的 C++ 元数据适配器。镜像已包含所需 Python、`dpkg-deb` 和 GCC。
-
-每次启动重新计算 SDK 归档、构建源码和缓存文件的 SHA256，并与构建清单核对；归档更新或本工具管理的缓存缺失、损坏时自动重建。缓存和准备状态保存在 `/data/sdk`，解包、编译等临时内容统一放在 `/data/sdk/.insta360-openconverter/`。官方压缩包本身损坏时，替换为完整官方包后重新启动。
-
-`doctor`、`once`、`watch` 和 `metadata` 都会先完成所需 SDK 的自动准备与校验；`metadata` 仅准备元数据 SDK。可使用 `docker compose run --rm converter doctor` 检查依赖和 SDK 接口，使用 `docker compose run --rm converter once` 执行一次扫描。
-
-一次性命令与后台服务共用 `/data` 时，先执行 `docker compose stop converter`，完成后用 `docker compose up -d` 恢复服务。同一数据目录只允许一个实例运行。
-
-| 命令 | 行为 |
-| --- | --- |
-| `doctor` | 检查依赖和 SDK 命令行接口，不执行素材拼接 |
-| `once` | 扫描一遍后退出；存在失败或等待中的文件时返回 1，全部完成时返回 0 |
-| `watch` | 启动时立即扫描，默认每 60 分钟触发一批；每批重新检查失败任务，单文件失败不影响其他任务 |
-| `metadata <文件路径>` | 只提取元数据和传感器轨迹，不调用 MediaSDK，不生成预览 |
-
-依赖或配置无效时启动失败。`SIGTERM/SIGINT` 会终止当前 SDK 子进程组并清理本次临时文件，不发布半成品。首次部署需检查测试档案的画面、声音、拍摄时间与 GPS，再接入完整档案。
-
-`watch` 按固定周期触发扫描；上一批仍在处理时跳过到期批次，批次之间不会并行。当前批次完成后等待下一个未来计划点，不补跑已经错过的批次。每批都会重新检查失败任务，恢复后可再次处理。
-
-重启后依据持久化状态按文件恢复：成功且未变的产物跳过，未完成文件从原片重新处理，原片始终保留。中断时的 `processing` 记录在恢复扫描时回到待处理状态。SDK 未提供视频帧级续转能力。
-
-修改配置或 GPU 设备后，重新运行上述 `up -d --force-recreate` 命令生效；仅修改配置无需重建镜像。
-
-独立元数据读取示例（使用同一容器配置，不调用 MediaSDK）：
-
-```bash
-docker compose run --rm converter metadata /photo/VID_sample.insv
-```
-
-结果保存在源文件同目录的 `VID_sample_metadata.json` 中，与自动转换使用相同命名规则。完成日志中的 `snapshot` 指向该文件。源文件解析失败时返回错误，不会静默使用 ExifTool 代替官方 SDK。
-
-### 转换配置
-
-配置文件为 `/data/config.toml`，完整示例见 [config.example.toml](config.example.toml)。
-
-升级时，请从已有配置中删除已移除的 `sdk.mode` 和 `sdk.cpu_compatible`，避免加载未知配置项失败。
-
-扫描周期统一使用分钟，推荐配置 `scan_interval_minutes`。旧键 `scan_interval` 仍可读取，但其值也按分钟解释，且不能与新键同时配置。旧 `retry_seconds` 兼容读取时会被忽略，可从配置中删除；失败任务由下一批扫描重新检查。
-
-默认优先保留源画质，不统一缩放到固定分辨率或限制为固定码率。已有配置若仍指定 `3840` / `1920`、`20000000`、`h264` 和 `flowstate = true`，需分别改为 `0` / `0`、`0`、`source` 和 `false` 才能采用新默认。
-
-`flowstate` 控制视频，照片使用独立的 `photo_flowstate`，默认值为 `true`。照片的 FlowState 在同一次 SDK 拼接导出中启用，不追加 JPEG 重编码或缩放；其姿态校正效果仍需在目标 GPU 上用对应机型的原片验证。
-
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `photo_root` | `/photo` | 容器内档案根目录，需与挂载位置一致 |
-| `scan_interval_minutes` | `60` | 固定扫描周期，分钟；启动时立即扫描 |
-| `settle_seconds` | `120` | 源文件最后修改后的等待时间，秒 |
-| `command_timeout` | `7200` | 单条外部命令超时，秒 |
-| `width` / `height` | `0` / `0` | 自动推导源尺寸；也可同时指定偶数尺寸，宽高比须为 2:1 |
-| `bitrate` | `0` | 按源主视频流合计码率确定编码预算；也可指定 bps |
-| `codec` | `source` | 跟随源 H.264 / H.265；可显式选择 `h264` / `h265` |
-| `flowstate` | `false` | 视频 FlowState 防抖开关 |
-| `photo_flowstate` | `true` | 照片 SDK 拼接中的 FlowState 开关，独立于视频设置 |
-| `sdk.source_root` | `/sdk` | 官方 SDK 压缩包所在目录，默认只读挂载宿主机 `sdk/` |
-| `metadata.reader` | `/data/sdk/metadata/bin/insta360-metadata` | 官方元数据 SDK 的本地适配器 |
-| `metadata.library_dirs` | `["/data/sdk/metadata/lib"]` | 元数据 SDK 运行库目录 |
-
-自动尺寸识别支持单个 2:1 主图像/视频流，以及双路同尺寸方形视频流；后者输出为单路宽度的两倍、高度不变。其他镜头布局需显式配置 `width` / `height`，无法确定时记录失败。源视频流缺少码率时，每个输入文件最多使用一次容器总码率估算；仍不可用时交由 SDK 使用源码率。相同码率只代表编码预算，不保证相同画质。
-
-转换后核对尺寸、视频编码、帧率、位深、色度采样和源文件中已知的色彩描述；不符合保留要求的产物不会发布。10-bit 视频使用 H.265，须由 SDK 明确提供 `-enable_10bit`，并通过实际输出检查。源探测结果、导出计划和实际输出参数写入目录处理报告中对应文件条目的 `quality` 字段及审计日志。
-
-全景拼接需要重投影和重新编码，MP4/JPG 输出不属于无损封装转换。程序默认不追加滤镜、降噪、增强或第二次 JPEG 编码；JPEG 质量由 SDK 内部控制，公开 CLI 未提供质量参数。SDK 可能仍执行其内部默认处理，例如部分演示版本默认启用且无法通过 CLI 关闭的 StitchFusion。实际画质和各机型兼容性需使用官方 SDK 与原片验证。
 
 ## 目录和处理规则
 
@@ -221,39 +342,6 @@ InsMetaDataSDK 的 `GetFirstTimeStamp()` 是陀螺仪时间基准，不能作为
 
 可识别的旧版目录报告 `insta360-preview-report.txt` 会在成功迁移后改用新名称和标准 JSON 格式，保留原有文件记录；迁移过程中保护无法确认归属的文件。更早版本生成的 `/data/metadata` 历史文件和逐文件 `*_preview.txt` 说明不会自动删除。升级后，后续扫描会按新规则在源文件旁生成元数据 JSON，并按实际目录汇总处理报告；确认归档和备份后可自行整理历史文件。
 
-## 升级
-
-1. 在 [GitHub Actions](https://github.com/LoneSpectator/Insta360-OpenConverter/actions) 确认目标版本的镜像已构建并发布成功。使用 `latest` 时，等待对应 `main` 提交的工作流成功后再拉取。
-
-2. 在现有仓库根目录停止服务、备份配置和处理状态，再更新仓库文件。停止后备份可保持 SQLite 状态及其附属文件一致：
-
-    ```bash
-    docker compose stop
-    backup_dir="data/upgrade-backups/$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$backup_dir"
-    cp -a .env data/config.toml data/state.sqlite3* "$backup_dir/"
-    git pull --ff-only
-    ```
-
-3. 对照更新后的 `config.example.toml`，逐项合并新增配置到已有 `data/config.toml`，保留现有路径和转换参数。扫描周期推荐使用 `scan_interval_minutes = 60`；采用该键时删除旧 `scan_interval`，两者不能同时配置。旧 `retry_seconds` 已忽略，可删除。若 `.env` 固定了镜像版本或 digest，将 `CONVERTER_IMAGE` 更新为目标版本，并保留原值以便回退。
-
-4. 拉取新镜像并重建容器。只拉取镜像不会替换正在运行的容器：
-
-    ```bash
-    docker compose pull
-    docker compose up -d --force-recreate
-    ```
-
-5. 查看启动与扫描日志，并检查原片目录中的处理报告：
-
-    ```bash
-    docker compose logs --tail=100
-    ```
-
-升级保留 `sdk/` 中的官方包、原片、元数据和 `/data` 中的状态。容器自动检查 SDK 缓存并按需准备；状态与产物校验通过的已完成文件会复用，未完成文件从原片重新处理，缺失元数据会补回并复用已有预览。旧版目录报告按前述规则自动迁移，既有用户文件冲突会受到保护。升级无需手动构建镜像或解包 SDK。
-
-照片方向规则和 `photo_flowstate` 有独立的状态标识：规则或设置改变后，本工具拥有的旧 JPG 预览会从原片重新导出，视频不会因此重新转码。手动修改过的预览继续受到保护；需要重新生成时，先备份再移除对应 JPG，随后扫描会重新处理。
-
 ## GitHub 自动构建和 GHCR
 
 工作流见 [`.github/workflows/container.yml`](.github/workflows/container.yml)。PR 运行测试和构建，不登录/推送；`main` 更新、`v*` 标签和手动触发在测试通过后构建 **linux/amd64** 并发布。测试同时覆盖开发用 Python 3.12 和镜像内 Python 3.10/系统媒体工具；镜像内测试使用非 root 用户和只读根文件系统，成功后才推送。只使用 GitHub 提供的 `GITHUB_TOKEN`，不需要将 SDK 或个人 PAT 放进 Actions secrets。
@@ -262,22 +350,7 @@ InsMetaDataSDK 的 `GetFirstTimeStamp()` 是陀螺仪时间基准，不能作为
 
 镜像地址：`ghcr.io/lonespectator/insta360-openconverter`。`main` 发布 `latest`、`main` 和 `sha-…`；`v0.1.0` 发布 `0.1.0`、`0.1` 和 `sha-…`。生产部署建议固定版本或镜像 digest。仓库需允许 GitHub Actions，包策略需允许工作流写入 GHCR。公开包支持匿名拉取，私有包需要先登录 GHCR。
 
-Compose 默认使用 GHCR 的 `latest` 镜像，也可在 `.env` 中通过 `CONVERTER_IMAGE` 指定版本或镜像 digest：
-
-```dotenv
-CONVERTER_IMAGE=ghcr.io/lonespectator/insta360-openconverter:latest
-```
-
-然后部署，无需本机构建：
-
-```bash
-docker compose pull
-docker compose up -d
-```
-
 镜像内包含应用、公共工具和适配器源码。宿主机 `sdk/` 中的官方压缩包只读挂载到 `/sdk`，由容器在 `/data/sdk` 自动准备运行文件。SDK 压缩包、动态库、模型和授权文件不纳入公开仓库或默认镜像。
-
-MediaSDK 的命令行程序也会链接图形运行库，镜像包含 GTK 3 和 FreeGLUT，无需启动桌面环境。启动出现 `error while loading shared libraries`（例如缺少 `libgtk-3.so.0`）时，先拉取最新镜像并用 `docker compose up -d --force-recreate` 重建容器。此类报错表示运行环境缺少动态库，需检查镜像依赖或库搜索路径；仅在官方包本身不完整时才需重新获取 SDK。
 
 ## 开发与验证
 
