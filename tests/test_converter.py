@@ -575,6 +575,9 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(set(json.loads(other_report.read_text())["files"]), {other.name})
 
     def test_directory_report_shows_processing_and_all_pending_files_during_conversion(self):
+        # This case checks the ordered one-worker mode; concurrent progress is
+        # covered with controlled overlapping subprocesses in its own tests.
+        self.cfg.max_concurrent_jobs = 1
         first = self.source("aaa-good.insp")
         failing = self.source("zzz-bad.insv")
         convert = self.service.media.convert
@@ -892,6 +895,7 @@ summary = {{**schema, "camera_type": "", "firmware_version": "", "serial_number"
         self.assertEqual(report["summary"]["success"], 2)
 
     def test_restart_resumes_interrupted_batch_without_reencoding_completed_files(self):
+        self.cfg.max_concurrent_jobs = 1
         completed = self.source("aaa-completed.insp")
         interrupted = self.source("bbb-interrupted.insv")
         pending = self.source("ccc-pending.insp")

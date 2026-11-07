@@ -2,6 +2,8 @@
 photo_root = "/photo"
 # 扫描周期，单位为分钟；启动时立即扫描，处理中跳过到期批次。
 scan_interval_minutes = 60
+# 同一批扫描最多同时处理 3 个任务；双镜头配对文件为一个任务。
+max_concurrent_jobs = 3
 # 文件最后修改至少 120 秒后才处理；转码结束时再次核对源文件。
 settle_seconds = 120
 command_timeout = 7200

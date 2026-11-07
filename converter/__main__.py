@@ -55,7 +55,7 @@ def main(argv=None):
         if args.command == "metadata":
             source = args.source.absolute()
             before = snapshot(source)
-            source_sha = digest(source, audit)
+            source_sha = digest(source, audit, stop)
             media = service.media
             media.metadata_sdk.doctor()
             metadata = media.source_metadata(source, before=before, source_sha256=source_sha)

@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import stat
 
+from .audit import Cancelled
 from .reports import LEGACY_REPORT_NAME, REPORT_NAME
 from .workspace import TEMP_ROOT_NAME, cleanup_stale_workspaces
 
@@ -23,12 +24,16 @@ def snapshot(path):
             "device": info.st_dev, "inode": info.st_ino}
 
 
-def digest(path, audit=None):
+def digest(path, audit=None, stop=None):
+    if stop is not None and stop.is_set():
+        raise Cancelled("Shutdown requested while hashing a file")
     if audit:
         audit.emit("file.read_hash", path=path)
     sha = hashlib.sha256()
     with path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            if stop is not None and stop.is_set():
+                raise Cancelled("Shutdown requested while hashing a file")
             sha.update(chunk)
     return sha.hexdigest()
 

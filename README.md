@@ -54,7 +54,7 @@ docker compose pull
 docker compose up -d
 ```
 
-默认使用 GitHub Actions 发布的 `ghcr.io/lonespectator/insta360-openconverter:latest` 镜像。容器自动运行后台扫描服务：准备 SDK 后立即扫描 `/photo`，随后每 **60 分钟**扫描一次。档案中的新文件、失败任务和被删除的预览会在后续扫描中重新检查。
+默认使用 GitHub Actions 发布的 `ghcr.io/lonespectator/insta360-openconverter:latest` 镜像。容器自动运行后台扫描服务：准备 SDK 后立即扫描 `/photo`，随后每 **60 分钟**扫描一次，默认最多同时处理 **3 个任务**。档案中的新文件、失败任务和被删除的预览会在后续扫描中重新检查。
 
 查看运行日志：
 
@@ -122,6 +122,7 @@ docker compose up -d
 | --- | --- | --- |
 | `photo_root` | `"/photo"` | 容器内档案根目录；更改时同步调整 Compose 挂载目标 |
 | `scan_interval_minutes` | `60` | 固定扫描周期，分钟，正整数；启动时立即扫描 |
+| `max_concurrent_jobs` | `3` | 同一批扫描最多同时处理的任务数，正整数；`1` 为逐个处理，双镜头配对文件算一个任务 |
 | `settle_seconds` | `120` | 原片最后修改后的等待时间，秒，可为 `0` |
 | `command_timeout` | `7200` | 单条外部命令超时，秒，正整数 |
 | `width` / `height` | `0` / `0` | 同时为 `0` 时推导源尺寸；显式设置须均为正偶数且宽高比为 2:1 |
@@ -141,11 +142,16 @@ docker compose up -d
 | `metadata.reader` | `"/data/sdk/metadata/bin/insta360-metadata"` | 官方元数据 SDK 的本地适配器 |
 | `metadata.library_dirs` | `["/data/sdk/metadata/lib"]` | 元数据 SDK 运行库搜索目录 |
 
-例如将扫描周期改为 30 分钟，编辑 `data/config.toml` 中已有的对应行：
+例如将扫描周期改为 30 分钟，并设置最多同时处理 3 个任务，编辑 `data/config.toml` 中的对应配置：
 
 ```toml
 scan_interval_minutes = 30
+max_concurrent_jobs = 3
 ```
+
+并发任务共用选中的 GPU，各任务使用独立的 SDK 进程和工作目录。实际并发能力受 GPU 显存、编解码会话数量和存储带宽影响，增加并发数不保证按比例提高速度；资源不足时可将 `max_concurrent_jobs` 调整为 `1`。修改该调度项不会使已成功且未变的预览重新转码。
+
+官方[接口文档](https://github.com/Insta360Develop/Insta360-Developer_Docs/blob/main/docs/ch/sdk/x-ace-go/desktop/media.md)说明视频导出为异步调用，但未明确承诺同一 GPU 上多路拼接的兼容性或并发上限。三路并发需结合实际 SDK 版本、GPU 和素材验证。
 
 修改 `.env` 或 `data/config.toml` 后，在部署目录重建容器使配置生效：
 
@@ -235,7 +241,7 @@ docker compose up -d
 
 MediaSDK 的命令行程序也会链接图形运行库，镜像包含 GTK 3 和 FreeGLUT，无需启动桌面环境。启动出现 `error while loading shared libraries`（例如缺少 `libgtk-3.so.0`）时，先拉取最新镜像并用 `docker compose up -d --force-recreate` 重建容器。此类报错表示运行环境缺少动态库，需检查镜像依赖或库搜索路径；仅在官方包本身不完整时才需重新获取 SDK。
 
-后台 `watch` 按固定周期触发扫描；上一批仍在处理时跳过到期批次，批次之间不会并行。当前批次完成后等待下一个未来计划点，不补跑错过的批次。每批重新检查失败任务。
+后台 `watch` 按固定周期触发扫描；上一批仍在处理时跳过到期批次，批次之间不会并行。同一批内部按 `max_concurrent_jobs` 限制并发任务数，默认最多同时处理 3 个任务；双镜头配对的两个原片共用一个转换任务。当前批次完成后等待下一个未来计划点，不补跑错过的批次。每批重新检查失败任务。
 
 重启后依据持久化状态按文件恢复：成功且未变的产物跳过，未完成文件从原片重新处理，原片始终保留。中断时的 `processing` 记录在恢复扫描时回到待处理状态；SDK 未提供视频帧级续转能力。收到 `SIGTERM/SIGINT` 时会终止当前 SDK 子进程组并尝试清理临时文件，不发布半成品。
 

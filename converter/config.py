@@ -15,6 +15,7 @@ class Config:
     photo_root: Path = Path("/photo")
     data_root: Path = Path("/data")
     scan_interval_minutes: int = 60
+    max_concurrent_jobs: int = 3
     settle_seconds: int = 120
     command_timeout: int = 7200
     width: int = 0
@@ -68,7 +69,7 @@ class Config:
         return cfg
 
     def validate(self):
-        for key in ("scan_interval_minutes", "command_timeout"):
+        for key in ("scan_interval_minutes", "max_concurrent_jobs", "command_timeout"):
             value = getattr(self, key)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{key} must be a positive integer")
@@ -159,8 +160,10 @@ class Config:
 
     def fingerprint(self):
         values = asdict(self)
-        # Photo-only settings are included in each photo job's identity.
-        for key in ("scan_interval_minutes", "settle_seconds", "command_timeout", "data_root", "photo_flowstate"):
+        # Scheduling does not change rendered output; photo-only settings are
+        # included in each photo job's identity.
+        for key in ("scan_interval_minutes", "max_concurrent_jobs", "settle_seconds",
+                    "command_timeout", "data_root", "photo_flowstate"):
             values.pop(key)
         values["pipeline_version"] = 3
         # Replacing the local SDK also invalidates successful jobs.

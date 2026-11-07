@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import threading
 
 
 TEMP_ROOT_NAME = ".insta360-openconverter"
@@ -18,6 +19,10 @@ _KIND = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
 _LEGACY_EMPTY = re.compile(
     r"(?:report|preview|metadata-read|metadata-json|atomic|sdk-media|sdk-metadata)-[0-9a-f]{16}\Z")
 _DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+# A finishing task closes its lock before unlinking it for NFS compatibility.
+# Serialize that short transition with in-process recovery, which otherwise
+# can acquire the released lock and delete the same workspace simultaneously.
+_CONTROLS = threading.RLock()
 
 
 def _emit(audit, event, **detail):
@@ -201,6 +206,11 @@ def _prepare_cleanup(child_fd, kind):
 
 def cleanup_stale_workspaces(parent, audit=None):
     """Remove only marked, unlocked workspaces; preserve everything unknown."""
+    with _CONTROLS:
+        return _cleanup_stale_workspaces(parent, audit)
+
+
+def _cleanup_stale_workspaces(parent, audit=None):
     parent = Path(parent)
     root = parent / TEMP_ROOT_NAME
     try:
@@ -280,12 +290,17 @@ def temporary_workspace(parent, audit=None, kind="work"):
     parent = Path(parent)
     if not isinstance(kind, str) or _KIND.fullmatch(kind) is None:
         raise ValueError("Temporary workspace kind must be a simple name")
-    cleanup_stale_workspaces(parent, audit)
+    _CONTROLS.acquire()
     try:
-        parent_fd, root_fd = _open_root(parent, create=True)
-    except OSError as error:
-        if error.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise RuntimeError(f"Temporary workspace root is not a real directory: {parent / TEMP_ROOT_NAME}") from error
+        cleanup_stale_workspaces(parent, audit)
+        try:
+            parent_fd, root_fd = _open_root(parent, create=True)
+        except OSError as error:
+            if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise RuntimeError(f"Temporary workspace root is not a real directory: {parent / TEMP_ROOT_NAME}") from error
+            raise
+    except BaseException:
+        _CONTROLS.release()
         raise
     name = None
     final_name = None
@@ -332,7 +347,11 @@ def temporary_workspace(parent, audit=None, kind="work"):
         name = final_name
         path = parent / TEMP_ROOT_NAME / name
         _emit(audit, "file.create_temporary_directory", path=path)
-        yield path
+        _CONTROLS.release()
+        try:
+            yield path
+        finally:
+            _CONTROLS.acquire()
     finally:
         try:
             if name is not None and child_fd is not None:
@@ -355,9 +374,12 @@ def temporary_workspace(parent, audit=None, kind="work"):
             _cleanup_warning(audit, parent / TEMP_ROOT_NAME / name if name else parent / TEMP_ROOT_NAME,
                              error)
         finally:
-            if lock_fd is not None:
-                os.close(lock_fd)
-            if child_fd is not None:
-                os.close(child_fd)
-            os.close(root_fd)
-            os.close(parent_fd)
+            try:
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                if child_fd is not None:
+                    os.close(child_fd)
+                os.close(root_fd)
+                os.close(parent_fd)
+            finally:
+                _CONTROLS.release()

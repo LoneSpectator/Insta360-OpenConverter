@@ -16,6 +16,7 @@ class Cancelled(RuntimeError):
 
 class Audit:
     def __init__(self, data_root: Path):
+        self._lock = threading.Lock()
         logs = data_root / "log"
         logs.mkdir(parents=True, exist_ok=True)
         self.run_id = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S.%f%z") + f"-{os.getpid()}"
@@ -23,16 +24,19 @@ class Audit:
         self.file = self.path.open("x", encoding="utf-8", buffering=1)
 
     def emit(self, event, **fields):
-        record = {"time": datetime.now().astimezone().isoformat(), "run_id": self.run_id,
-                  "event": event, **fields}
-        line = json.dumps(record, ensure_ascii=False, default=str)
-        self.file.write(line + "\n")
-        print(line, file=sys.stdout, flush=True)
+        with self._lock:
+            record = {"time": datetime.now().astimezone().isoformat(), "run_id": self.run_id,
+                      "event": event, **fields}
+            line = json.dumps(record, ensure_ascii=False, default=str)
+            self.file.write(line + "\n")
+            print(line, file=sys.stdout, flush=True)
 
     def close(self):
-        self.file.flush()
-        os.fsync(self.file.fileno())
-        self.file.close()
+        with self._lock:
+            if not self.file.closed:
+                self.file.flush()
+                os.fsync(self.file.fileno())
+                self.file.close()
 
 
 class Runner:
@@ -55,6 +59,7 @@ class Runner:
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
         selector.register(process.stderr, selectors.EVENT_READ, "stderr")
         try:
+            self.audit.emit("command.spawn", pid=process.pid, argv=argv, cwd=cwd)
             while selector.get_map():
                 if self.stop.is_set():
                     raise Cancelled("Shutdown requested during command")

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import threading
 
 from .report_errors import explain_error, explain_reason
 from .workspace import temporary_workspace
@@ -167,20 +168,33 @@ def _refresh(data):
 class DirectoryReports:
     def __init__(self, audit):
         self.audit = audit
+        self._locks = {}
+        self._locks_guard = threading.Lock()
+
+    def _lock_for(self, path):
+        # Serialize the entire read/modify/publish operation for one report.
+        # Reports in other directories remain independent.
+        key = os.path.abspath(path)
+        with self._locks_guard:
+            if key not in self._locks:
+                self._locks[key] = threading.RLock()
+            return self._locks[key]
 
     def check(self, job):
         for path in report_paths(job):
-            _load(path)
+            with self._lock_for(path):
+                _load(path)
 
     def has(self, job, status):
         complete = True
         for path in report_paths(job):
-            data, _, _ = _load(path)
-            for source in job.sources:
-                if source.parent == path.parent:
-                    entry = data["files"].get(source.name)
-                    if not entry or entry.get("status") != status or not entry.get("present", True):
-                        complete = False
+            with self._lock_for(path):
+                data, _, _ = _load(path)
+                for source in job.sources:
+                    if source.parent == path.parent:
+                        entry = data["files"].get(source.name)
+                        if not entry or entry.get("status") != status or not entry.get("present", True):
+                            complete = False
         return complete
 
     def _publish(self, path, data, before, legacy, *, status, names):
@@ -235,21 +249,22 @@ class DirectoryReports:
         for parent, current in grouped.items():
             path = parent / REPORT_NAME
             try:
-                data, before, legacy = _load(path, self.audit)
-                if not current and before is None and legacy is None:
-                    continue
-                previous = deepcopy(data)
-                for name, entry in data["files"].items():
-                    entry["present"] = name in current
-                    if name in current and entry["status"] == "processing":
-                        entry.update(status="pending", time=now, run_id=self.audit.run_id)
-                for name, (source, job) in current.items():
-                    if name not in data["files"]:
-                        data["files"][name] = _entry(job, source, "pending", now, self.audit.run_id)
-                data = _refresh(data)
-                if data != previous or legacy is not None:
-                    data["updated_at"] = now
-                    self._publish(path, data, before, legacy, status="scan", names=list(current))
+                with self._lock_for(path):
+                    data, before, legacy = _load(path, self.audit)
+                    if not current and before is None and legacy is None:
+                        continue
+                    previous = deepcopy(data)
+                    for name, entry in data["files"].items():
+                        entry["present"] = name in current
+                        if name in current and entry["status"] == "processing":
+                            entry.update(status="pending", time=now, run_id=self.audit.run_id)
+                    for name, (source, job) in current.items():
+                        if name not in data["files"]:
+                            data["files"][name] = _entry(job, source, "pending", now, self.audit.run_id)
+                    data = _refresh(data)
+                    if data != previous or legacy is not None:
+                        data["updated_at"] = now
+                        self._publish(path, data, before, legacy, status="scan", names=list(current))
             except (OSError, RuntimeError, ValueError, TypeError) as error:
                 errors[parent] = str(error)
                 self.audit.emit("report.scan_failed", path=path, error=str(error))
@@ -258,13 +273,14 @@ class DirectoryReports:
     def write(self, job, status, **detail):
         if status not in STATUS_TEXT:
             raise ValueError(f"Unknown report status: {status}")
-        now = datetime.now().astimezone().isoformat()
         for path in report_paths(job):
-            data, before, legacy = _load(path, self.audit)
-            for source in job.sources:
-                if source.parent == path.parent:
-                    data["files"][source.name] = _entry(job, source, status, now, self.audit.run_id, **detail)
-            data = _refresh(data)
-            data["updated_at"] = now
-            self._publish(path, data, before, legacy, status=status,
-                          names=[source.name for source in job.sources if source.parent == path.parent])
+            with self._lock_for(path):
+                now = datetime.now().astimezone().isoformat()
+                data, before, legacy = _load(path, self.audit)
+                for source in job.sources:
+                    if source.parent == path.parent:
+                        data["files"][source.name] = _entry(job, source, status, now, self.audit.run_id, **detail)
+                data = _refresh(data)
+                data["updated_at"] = now
+                self._publish(path, data, before, legacy, status=status,
+                              names=[source.name for source in job.sources if source.parent == path.parent])
