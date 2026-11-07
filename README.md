@@ -211,6 +211,8 @@ docker compose run --rm converter metadata /photo/VID_sample.insv
 
 ExifTool 补充 SDK 未公开的标准拍摄时间等字段，复制目标格式支持的 EXIF/XMP/IPTC 或 QuickTime 字段，并写入与回读核对预览的拍摄时间、相机信息、GPS 和全景标记。尺寸与全景几何字段更新为预览实际值。MP4 保留可复制的 QuickTime 日期，拍摄时间同时写到 XMP；文件 mtime 跟随第一原片。
 
+ExifTool 的读取、复制、写入和回读均启用大文件支持，以读取大 INSV 的拍摄字段并写入大 MP4 的全景标记，无需额外配置。
+
 照片先记录 SDK 导出的 JPG 方向标记，再复制原片拍摄字段。最终 EXIF/XMP 方向保持 SDK 渲染后的显示语义，不复制原片的 `Orientation` 或 IFD1 缩略图；SDK 未提供方向标记时不从原片补出。元数据写入不旋转图像像素、不追加 JPEG 编码。方向标签一致性检查不能替代对实际画面朝向的验收。
 
 InsMetaDataSDK 的 `GetFirstTimeStamp()` 是陀螺仪时间基准，不能作为拍摄日期。SDK 2.0.2 的 GPS `timestampMs` 字段名与头文件的秒单位注释存在歧义，因此轨迹保留原值，不猜测时间单位或转换成 UTC 日期。缺失的拍摄时间会记入日志，不从文件名或目录名推断。

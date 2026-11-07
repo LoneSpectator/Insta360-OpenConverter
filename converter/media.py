@@ -83,7 +83,8 @@ class Media:
 
     def metadata(self, path):
         result = json.loads(self.runner.run([
-            self.cfg.exiftool, "-j", "-G1", "-a", "-s", "-n", "-u", path], capture=True))
+            self.cfg.exiftool, "-api", "LargeFileSupport=1",
+            "-j", "-G1", "-a", "-s", "-n", "-u", path], capture=True))
         if len(result) != 1 or result[0].get("ExifTool:Error"):
             raise RuntimeError(f"Cannot read metadata for {path}: {result}")
         return result[0]
@@ -154,7 +155,8 @@ class Media:
         photo = output.suffix == ".jpg"
         rendered = self.metadata(output) if photo else {}
         orientation = sdk_orientation(rendered) if photo else None
-        argv = [cfg.exiftool, "-overwrite_original", "-TagsFromFile", source, "-XMP:all"]
+        argv = [cfg.exiftool, "-api", "LargeFileSupport=1",
+                "-overwrite_original", "-TagsFromFile", source, "-XMP:all"]
         if photo:
             # Source direction and thumbnails describe the original pixels.
             # Retain the SDK-rendered image's direction and thumbnail instead.
@@ -197,7 +199,7 @@ class Media:
                             f"-{group}:CroppedAreaImageWidthPixels={plan.width}",
                             f"-{group}:CroppedAreaImageHeightPixels={plan.height}",
                             f"-{group}:CroppedAreaLeftPixels=0", f"-{group}:CroppedAreaTopPixels=0"])
-        self.runner.run([cfg.exiftool, "-overwrite_original", *assignments, output])
+        self.runner.run([cfg.exiftool, "-api", "LargeFileSupport=1", "-overwrite_original", *assignments, output])
         actual = self.metadata(output)
         if photo:
             verify_orientation(orientation, actual)

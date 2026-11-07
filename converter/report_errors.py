@@ -164,6 +164,10 @@ def explain_error(raw):
     if "InsMetaDataSDK Parse failed" in text:
         return result("metadata_sdk_parse_failed",
                       "官方元数据 SDK 无法解析原文件，请检查文件是否上传完整及该机型、格式是否受 SDK 支持。")
+    if re.search(r"(?:^|:\s|\n)(?:Error|Warning): End of processing at large atom "
+                 r"\(LargeFileSupport not enabled\)", text):
+        return result("metadata_large_file_support_disabled",
+                      "元数据工具未启用大文件支持，无法读取或写入大视频的元数据。请更新容器镜像后重试。")
     if re.search(r"no CUDA-capable device|CUDA driver version is insufficient|"
                  r"No CUDA devices|CUDA initialization error", text):
         return result("gpu_initialization_failed",

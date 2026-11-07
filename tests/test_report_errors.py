@@ -74,6 +74,18 @@ class ReportErrorTests(unittest.TestCase):
                 self.assertIn("方向标记", result["error"])
                 self.assertEqual(result["error_raw"], raw)
 
+    def test_large_video_metadata_error_is_not_reported_as_generic_command_failure(self):
+        for prefix in ("Error", "Warning"):
+            raw = ("exiftool exited 1: Warning: [minor] No media data - /photo/大视频.mp4\n"
+                   f"{prefix}: End of processing at large atom (LargeFileSupport not enabled) - /photo/大视频.mp4\n")
+            with self.subTest(prefix=prefix):
+                result = explain_error(raw)
+                self.assertEqual(result["error_code"], "metadata_large_file_support_disabled")
+                self.assertIn("大文件支持", result["error"])
+                self.assertEqual(result["error_raw"], raw)
+        filename = "exiftool exited 1: unrelated - /photo/End of processing at large atom (LargeFileSupport not enabled).mp4"
+        self.assertEqual(explain_error(filename)["error_code"], "command_failed")
+
     def test_command_timeout_and_failure_are_actionable_without_guessing_sdk_cause(self):
         raw = "Command exceeded 7200s: /data/sdk/media/bin/MediaSDKTest"
         self.assertEqual(explain_error(raw)["error_code"], "command_timeout")
